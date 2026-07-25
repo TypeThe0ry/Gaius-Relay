@@ -19,8 +19,20 @@ function parseList(name, fallback) {
         .map((item) => item.trim())
         .filter((item) => item.length > 0);
 }
+function parseName(name, fallback) {
+    const raw = process.env[name];
+    if (raw === undefined) {
+        return fallback;
+    }
+    const value = raw.trim();
+    if (value.length === 0 || value.length > 80 || /[\r\n]/u.test(value)) {
+        throw new Error(`${name} must be a non-empty single-line value of at most 80 chars`);
+    }
+    return value;
+}
 export function loadConfig() {
     const accessToken = process.env.GAIUS_BRIDGE_TOKEN;
+    const proxyKeepAlives = process.env.GAIUS_PROXY_KEEPALIVES !== "0";
     return {
         listenHost: process.env.GAIUS_BRIDGE_HOST ?? "127.0.0.1",
         listenPort: parseInteger("GAIUS_BRIDGE_PORT", 8080, 1, 65535),
@@ -38,5 +50,7 @@ export function loadConfig() {
         idleTimeoutMs: parseInteger("GAIUS_IDLE_TIMEOUT_MS", 10 * 60_000, 1_000, 3_600_000),
         maximumConnections: parseInteger("GAIUS_MAXIMUM_CONNECTIONS", 1024, 1, 100_000),
         maximumFrameBytes: parseInteger("GAIUS_MAXIMUM_FRAME_BYTES", 16 * 1024 * 1024, 1024, 16 * 1024 * 1024),
+        proxyKeepAlives,
+        relayName: parseName("GAIUS_RELAY_NODE_NAME", "Gaius RelayNode"),
     };
 }

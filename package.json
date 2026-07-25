@@ -1,0 +1,17 @@
+{
+  "name": "@gaius/relay-node",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "WebSocket-to-TCP RelayNode for Gaius multiplayer",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node dist/main.js",
+    "smoke": "node multiplayer-smoke.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
+}

@@ -6,6 +6,9 @@ import { WebSocket, WebSocketServer, } from "ws";
 import { loadConfig } from "./config.js";
 import { isHostAllowed, isOriginAllowed, parseConnectRequest, } from "./policy.js";
 const config = loadConfig();
+const traceTunnel = process.env.GAIUS_TRACE_TUNNEL === "1";
+const relayNodeProtocolVersion = 1;
+const relayNodeManifestPath = "/relay-node/v1";
 const maximumResourcePackBytes = 250 * 1024 * 1024;
 const maximumTextureBytes = 16 * 1024 * 1024;
 const maximumAuthResponseBytes = 4 * 1024 * 1024;
@@ -14,7 +17,133 @@ const maximumRealmsResponseBytes = 16 * 1024 * 1024;
 const maximumRealmsRequestBytes = 4 * 1024 * 1024;
 const maximumWebSocketBufferedBytes = 4 * 1024 * 1024;
 const localTunnelWaitMs = 10 * 60 * 1000;
+// `ServerboundClientTickEndPacket` is emitted once per client tick in 1.21.11.
+// A resource/model reload can temporarily stop browser ticks, while a spawn
+// proxy can require the next tick before its short read timeout. Once the
+// browser has sent a real tick for this PLAY session, replaying it at vanilla
+// tick cadence is safe: the packet has no payload and only delimits the tick.
+const stalledClientTickIntervalMs = 50;
+const stalledClientTickGraceMs = 100;
 const localTunnelSessions = new Map();
+
+// A zero-compression keepalive is a complete 11-byte Minecraft frame. During a
+// large browser resource reload, acknowledging it in the RelayNode prevents a
+// backend read timeout without delaying arbitrary game packets. These ids are
+// from the 1.21.11 configuration and play protocol tables respectively.
+function proxyVanillaKeepAlive(socket, frame, playPhase) {
+    if (!config.proxyKeepAlives || frame.byteLength !== 11 ||
+        frame[0] !== 0x0a || frame[1] !== 0x00) {
+        return false;
+    }
+    const packetId = frame[2];
+    let responsePacketId;
+    if (packetId === 0x04) {
+        // Configuration uses the common keepalive packet id in both directions.
+        responsePacketId = 0x04;
+    }
+    else if (playPhase && packetId === 0x2b) {
+        // PLAY has different clientbound/serverbound packet registries.
+        responsePacketId = 0x1b;
+    }
+    else {
+        return false;
+    }
+    const response = Buffer.from(frame);
+    response[2] = responsePacketId;
+    socket.write(response);
+    traceTunnelEvent(
+        `proxied ${packetId === 0x04 ? "configuration" : "play"} keepalive `
+            + `head=${response.toString("hex")}`
+    );
+    return true;
+}
+
+function readMinecraftFrame(buffer) {
+    let length = 0;
+    let shift = 0;
+    for (let index = 0; index < 5; index++) {
+        if (index >= buffer.byteLength) {
+            return undefined;
+        }
+        const value = buffer[index];
+        length |= (value & 0x7f) << shift;
+        if ((value & 0x80) === 0) {
+            const headerBytes = index + 1;
+            if (length < 0 || length > config.maximumFrameBytes) {
+                return null;
+            }
+            const frameBytes = headerBytes + length;
+            if (buffer.byteLength < frameBytes) {
+                return undefined;
+            }
+            return {
+                frame: buffer.subarray(0, frameBytes),
+                remainder: buffer.subarray(frameBytes),
+                headerBytes,
+            };
+        }
+        shift += 7;
+    }
+    return null;
+}
+
+function isLoginEncryptionRequest(frame, headerBytes) {
+    // Encryption begins after this login packet. Once the client answers it,
+    // bytes are opaque and must remain a direct WebSocket-to-TCP tunnel.
+    return frame.byteLength > headerBytes && frame[headerBytes] === 0x01;
+}
+
+function isMinecraftHandshake(frame) {
+    const parsed = readMinecraftFrame(frame);
+    if (parsed === undefined || parsed === null || parsed.remainder.byteLength !== 0) {
+        return false;
+    }
+    const packetOffset = parsed.headerBytes;
+    const nextState = parsed.frame[parsed.frame.byteLength - 1];
+    return parsed.frame.byteLength > packetOffset + 2 &&
+        parsed.frame[packetOffset] === 0x00 && (nextState === 0x01 || nextState === 0x02);
+}
+
+function isClientTickEnd(chunk) {
+    return chunk.byteLength === 3 && chunk[0] === 0x02 &&
+        chunk[1] === 0x00 && chunk[2] === 0x0c;
+}
+
+function isConfigurationAcknowledgement(chunk) {
+    return chunk.byteLength === 3 && chunk[0] === 0x02 &&
+        chunk[1] === 0x00 && chunk[2] === 0x03;
+}
+
+function traceCustomPayload(frame, headerBytes, direction, playPhase) {
+    if (!traceTunnel || !playPhase || frame.byteLength <= headerBytes + 2) {
+        return;
+    }
+    // Compressed packet framing adds one zero byte before the packet id when
+    // the packet remains below the compression threshold. Only inspect that
+    // small, plaintext form; encrypted/compressed traffic stays opaque.
+    const packetOffset = frame[headerBytes] === 0x00 ? headerBytes + 1 : headerBytes;
+    const packetId = frame[packetOffset];
+    const expectedPacketId = direction === "server" ? 0x18 : 0x15;
+    if (packetId !== expectedPacketId || frame.byteLength <= packetOffset + 1) {
+        return;
+    }
+    const payload = frame.subarray(packetOffset + 1);
+    const channelLength = payload[0];
+    if (!Number.isInteger(channelLength) || channelLength < 1 ||
+        channelLength > payload.byteLength - 1) {
+        return;
+    }
+    const channel = payload.subarray(1, 1 + channelLength).toString("utf8");
+    const preview = payload.subarray(1 + channelLength, 1 + channelLength + 192)
+        .toString("utf8").replace(/[\u0000-\u001f\u007f-\uffff]/g, "?");
+    traceTunnelEvent(`PLAY custom payload ${direction} channel=${channel} preview=${preview}`);
+}
+
+function traceTunnelEvent(message) {
+    if (traceTunnel) {
+        console.info(`[Gaius tunnel trace] ${message}`);
+    }
+}
 const allowedAuthHosts = new Set([
     "api.minecraftservices.com",
     "api.mojang.com",
@@ -48,7 +177,8 @@ const webSocketServer = new WebSocketServer({
     perMessageDeflate: false,
 });
 httpServer.on("upgrade", (request, socket, head) => {
-    if (request.url !== "/tunnel") {
+    const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+    if (requestUrl.pathname !== "/tunnel") {
         socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
         socket.destroy();
         return;
@@ -72,6 +202,16 @@ webSocketServer.on("connection", (webSocket) => {
     let connected = false;
     let tcpPausedForWebSocket = false;
     let tcpPausedForClient = false;
+    let configurationAcknowledgements = 0;
+    let playPhase = false;
+    let serverFrameBuffer = Buffer.alloc(0);
+    // Only frame streams after a valid Minecraft handshake. This preserves the
+    // relay's raw-TCP behavior for generic tunnel tests and opaque protocols.
+    let packetFramingEnabled = false;
+    let encryptionResponsePending = false;
+    let observedPlayTick;
+    let lastClientTrafficAt = Date.now();
+    let clientStallTimer;
     let tunnelCancelled = false;
     let lastActivity = Date.now();
     const idleTimer = setInterval(() => {
@@ -81,7 +221,9 @@ webSocketServer.on("connection", (webSocket) => {
     }, Math.min(config.idleTimeoutMs, 5_000));
     idleTimer.unref();
     const closeBoth = (code, reason) => {
+        traceTunnelEvent(`closing tunnel code=${code} reason=${reason}`);
         clearInterval(idleTimer);
+        clearInterval(clientStallTimer);
         tunnelCancelled = true;
         tcpSocket?.destroy();
         if (webSocket.readyState === WebSocket.OPEN ||
@@ -98,6 +240,42 @@ webSocketServer.on("connection", (webSocket) => {
         }
         else {
             tcpSocket.resume();
+        }
+    };
+    clientStallTimer = setInterval(() => {
+        if (!connected || !playPhase || observedPlayTick === undefined ||
+            tcpSocket === undefined || Date.now() - lastClientTrafficAt < stalledClientTickGraceMs) {
+            return;
+        }
+        // Only replay a packet the client already used successfully in this PLAY
+        // session, while a browser resource reload has stopped client traffic.
+        tcpSocket.write(observedPlayTick);
+        lastClientTrafficAt = Date.now();
+        traceTunnelEvent("proxied observed play tick while browser was stalled");
+    }, stalledClientTickIntervalMs);
+    clientStallTimer.unref();
+    const forwardServerFrame = (frame) => {
+        if (webSocket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        webSocket.send(frame, { binary: true }, (error) => {
+            if (error) {
+                console.error(`WebSocket send error for ${request.host}:${request.port}:`, error.message);
+            }
+            if (error && webSocket.readyState === WebSocket.OPEN) {
+                closeBoth(1011, "WebSocket send failed");
+                return;
+            }
+            if (tcpPausedForWebSocket &&
+                webSocket.bufferedAmount < maximumWebSocketBufferedBytes) {
+                tcpPausedForWebSocket = false;
+                updateTcpReadState();
+            }
+        });
+        if (!tcpPausedForWebSocket &&
+            webSocket.bufferedAmount >= maximumWebSocketBufferedBytes) {
+            tcpPausedForWebSocket = true;
+            updateTcpReadState();
         }
     };
     webSocket.on("message", () => {
@@ -138,35 +316,54 @@ webSocketServer.on("connection", (webSocket) => {
                 connected = true;
                 webSocket.send(JSON.stringify({ type: "connected" }));
                 tcpSocket.on("data", (chunk) => {
+                    traceTunnelEvent(
+                        `server data ${request.host}:${request.port} bytes=${chunk.byteLength} `
+                            + `head=${chunk.subarray(0, 24).toString("hex")}`
+                    );
                     lastActivity = Date.now();
-                    if (webSocket.readyState !== WebSocket.OPEN) {
-                        return;
-                    }
-                    webSocket.send(chunk, { binary: true }, (error) => {
-                        if (error) {
-                            console.error(`WebSocket send error for ${request.host}:${request.port}:`, error.message);
-                        }
-                        if (error && webSocket.readyState === WebSocket.OPEN) {
-                            closeBoth(1011, "WebSocket send failed");
+                    if (!packetFramingEnabled) {
+                        if (proxyVanillaKeepAlive(tcpSocket, chunk, playPhase)) {
                             return;
                         }
-                        if (tcpPausedForWebSocket &&
-                            webSocket.bufferedAmount < maximumWebSocketBufferedBytes) {
-                            tcpPausedForWebSocket = false;
-                            updateTcpReadState();
+                        forwardServerFrame(chunk);
+                        return;
+                    }
+                    serverFrameBuffer = serverFrameBuffer.byteLength === 0
+                        ? chunk
+                        : Buffer.concat([serverFrameBuffer, chunk]);
+                    while (serverFrameBuffer.byteLength > 0) {
+                        const parsed = readMinecraftFrame(serverFrameBuffer);
+                        if (parsed === undefined) {
+                            return;
                         }
-                    });
-                    if (!tcpPausedForWebSocket &&
-                        webSocket.bufferedAmount >= maximumWebSocketBufferedBytes) {
-                        tcpPausedForWebSocket = true;
-                        updateTcpReadState();
+                        if (parsed === null) {
+                            // This is normally encrypted online-mode traffic.
+                            packetFramingEnabled = false;
+                            traceTunnelEvent("disabled keepalive proxy for opaque server traffic");
+                            forwardServerFrame(serverFrameBuffer);
+                            serverFrameBuffer = Buffer.alloc(0);
+                            return;
+                        }
+                        serverFrameBuffer = parsed.remainder;
+                        if (isLoginEncryptionRequest(parsed.frame, parsed.headerBytes)) {
+                            encryptionResponsePending = true;
+                        }
+                        traceCustomPayload(parsed.frame, parsed.headerBytes, "server", playPhase);
+                        if (!proxyVanillaKeepAlive(tcpSocket, parsed.frame, playPhase)) {
+                            forwardServerFrame(parsed.frame);
+                        }
                     }
                 });
                 tcpSocket.once("error", (error) => {
                     console.error("TCP tunnel error:", error.message);
                     closeBoth(1011, "TCP connection failed");
                 });
-                tcpSocket.once("close", () => closeBoth(1000, "TCP connection closed"));
+                tcpSocket.once("close", (hadError) => {
+                    traceTunnelEvent(
+                        `TCP closed ${request.host}:${request.port} hadError=${Boolean(hadError)}`
+                    );
+                    closeBoth(1000, "TCP connection closed");
+                });
             }, (error) => {
                 console.error("TCP tunnel setup error:", error);
                 closeBoth(1011, "TCP tunnel setup failed");
@@ -192,7 +389,35 @@ webSocketServer.on("connection", (webSocket) => {
                     }
                     return;
                 }
-                if (!tcpSocket.write(toBuffer(data))) {
+                const clientData = toBuffer(data);
+                lastClientTrafficAt = Date.now();
+                traceTunnelEvent(
+                    `client data ${request.host}:${request.port} bytes=${clientData.byteLength} `
+                        + `head=${clientData.subarray(0, 24).toString("hex")}`
+                );
+                if (!packetFramingEnabled && config.proxyKeepAlives &&
+                    isMinecraftHandshake(clientData)) {
+                    packetFramingEnabled = true;
+                    traceTunnelEvent("enabled framed keepalive proxy after Minecraft handshake");
+                }
+                if (isConfigurationAcknowledgement(clientData)) {
+                    configurationAcknowledgements++;
+                    playPhase = configurationAcknowledgements >= 2;
+                }
+                if (playPhase && isClientTickEnd(clientData)) {
+                    observedPlayTick = Buffer.from(clientData);
+                }
+                const clientFrame = packetFramingEnabled ? readMinecraftFrame(clientData) : undefined;
+                if (clientFrame && clientFrame !== null && clientFrame.remainder.byteLength === 0) {
+                    traceCustomPayload(clientFrame.frame, clientFrame.headerBytes, "client", playPhase);
+                }
+                if (encryptionResponsePending) {
+                    packetFramingEnabled = false;
+                    encryptionResponsePending = false;
+                    serverFrameBuffer = Buffer.alloc(0);
+                    traceTunnelEvent("disabled keepalive proxy after login encryption response");
+                }
+                if (!tcpSocket.write(clientData)) {
                     webSocket.pause();
                     tcpSocket.once("drain", () => webSocket.resume());
                 }
@@ -207,13 +432,17 @@ webSocketServer.on("connection", (webSocket) => {
         console.error("WebSocket tunnel error:", error.message);
         closeBoth(1011, "WebSocket error");
     });
-    webSocket.once("close", () => {
+    webSocket.once("close", (code, reason) => {
+        traceTunnelEvent(
+            `WebSocket closed code=${code} reason=${reason.toString()} connected=${connected}`
+        );
         clearInterval(idleTimer);
+        clearInterval(clientStallTimer);
         tcpSocket?.destroy();
     });
 });
 httpServer.listen(config.listenPort, config.listenHost, () => {
-    console.log(`Gaius bridge listening on http://${config.listenHost}:${config.listenPort}`);
+    console.log(`Gaius RelayNode listening on http://${config.listenHost}:${config.listenPort}`);
     console.log(`Allowed Minecraft hosts: ${config.allowedHosts.join(", ")}`);
     if (config.accessToken === undefined) {
         console.warn("GAIUS_BRIDGE_TOKEN is unset; this is acceptable only for local development.");
@@ -469,13 +698,8 @@ function toBuffer(data) {
 }
 async function handleHttpRequest(request, response) {
     const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
-    if (requestUrl.pathname === "/health") {
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({
-            ok: true,
-            activeConnections: webSocketServer.clients.size,
-            maximumConnections: config.maximumConnections,
-        }));
+    if (requestUrl.pathname === "/health" || requestUrl.pathname === relayNodeManifestPath) {
+        handleRelayNodeManifest(request, response);
         return;
     }
     let proxyKind;
@@ -528,6 +752,7 @@ async function handleHttpRequest(request, response) {
         response.end(error instanceof Error ? error.message : "Invalid target URL");
         return;
     }
+    traceTunnelEvent(`proxy ${proxyKind} request target=${target.origin}${target.pathname}`);
     const method = request.method ?? "GET";
     if ((proxyKind === "resource-pack" || proxyKind === "texture") && method !== "GET") {
         response.writeHead(405, { ...corsHeaders, allow: "GET, OPTIONS" });
@@ -583,6 +808,10 @@ async function handleHttpRequest(request, response) {
                 ? maximumRealmsResponseBytes
                 : maximumAuthResponseBytes;
     const declaredLength = Number(upstream.headers.get("content-length"));
+    traceTunnelEvent(
+        `proxy ${proxyKind} response status=${upstream.status} length=`
+            + `${Number.isFinite(declaredLength) ? declaredLength : "unknown"}`
+    );
     if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
         await upstream.body?.cancel("Proxy response exceeded size limit");
         response.writeHead(413, { ...corsHeaders, "content-type": "text/plain; charset=utf-8" });
@@ -619,6 +848,42 @@ async function handleHttpRequest(request, response) {
         }
     }
     response.end();
+    traceTunnelEvent(`proxy ${proxyKind} complete bytes=${received}`);
+}
+function handleRelayNodeManifest(request, response) {
+    const origin = request.headers.origin;
+    if (origin !== undefined && !isOriginAllowed(origin, config.allowedOrigins)) {
+        response.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
+        response.end("Origin is not allowed");
+        return;
+    }
+    const method = request.method ?? "GET";
+    if (method !== "GET" && method !== "HEAD") {
+        response.writeHead(405, { allow: "GET, HEAD" });
+        response.end();
+        return;
+    }
+    const activeConnections = webSocketServer.clients.size;
+    const body = JSON.stringify({
+        ok: true,
+        kind: "gaius-relay-node",
+        protocolVersion: relayNodeProtocolVersion,
+        name: config.relayName,
+        tunnelPath: "/tunnel",
+        activeConnections,
+        maximumConnections: config.maximumConnections,
+        availableConnections: Math.max(0, config.maximumConnections - activeConnections),
+        maximumFrameBytes: config.maximumFrameBytes,
+        requiresToken: config.accessToken !== undefined,
+        capabilities: ["tcp-tunnel", "srv-resolution", "flow-control", "keepalive-proxy"],
+    });
+    const headers = {
+        "cache-control": "no-store",
+        "content-type": "application/json; charset=utf-8",
+        ...(origin === undefined ? {} : createCorsHeaders(origin)),
+    };
+    response.writeHead(200, headers);
+    response.end(method === "HEAD" ? undefined : body);
 }
 function createCorsHeaders(origin) {
     return {

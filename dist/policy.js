@@ -48,7 +48,7 @@ export function parseConnectRequest(text) {
         typeof candidate.token !== "string") {
         throw new TypeError("Connect token must be a string");
     }
-    const host = normalizeHost(candidate.host);
+    const host = normalizeConnectHost(candidate.host, candidate.port);
     if (host.length === 0 || (isIP(host) === 0 && !isValidDnsName(host))) {
         throw new TypeError("Connect host is not a valid IP address or DNS name");
     }
@@ -58,6 +58,31 @@ export function parseConnectRequest(text) {
         port: candidate.port,
         ...(candidate.token === undefined ? {} : { token: candidate.token }),
     };
+}
+function normalizeConnectHost(host, port) {
+    const value = host.trim().toLowerCase();
+    if (value.startsWith("[")) {
+        const closingBracket = value.indexOf("]");
+        if (closingBracket <= 1) {
+            return value;
+        }
+        const remainder = value.slice(closingBracket + 1);
+        if (remainder.length === 0) {
+            return value.slice(1, closingBracket);
+        }
+        if (remainder === `:${port}`) {
+            return value.slice(1, closingBracket);
+        }
+        return value;
+    }
+    const firstColon = value.indexOf(":");
+    if (firstColon > 0 && firstColon === value.lastIndexOf(":")) {
+        const suffix = value.slice(firstColon + 1);
+        if (suffix === String(port)) {
+            return value.slice(0, firstColon);
+        }
+    }
+    return normalizeHost(value);
 }
 function isValidDnsName(host) {
     if (host.length > 253) {
