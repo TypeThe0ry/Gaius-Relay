@@ -1,0 +1,6 @@
+node_modules
+npm-debug.log
+*.log
+multiplayer-smoke.mjs
+online-mode-server-smoke.mjs
+README.md

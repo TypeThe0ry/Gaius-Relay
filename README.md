@@ -1,4 +1,4 @@
-# Gaius RelayNode
+# Gaius 转译节点（RelayNode）
 
 RelayNode is the self-hostable multiplayer component of Gaius. It creates one
 temporary WebSocket-to-TCP tunnel per browser connection for Minecraft status
@@ -55,3 +55,17 @@ Run the focused protocol test with:
 ```sh
 npm run smoke
 ```
+
+## Container deployment
+
+The repository includes a production container definition and a compose
+example. Copy `compose.example.yaml` to `compose.yaml`, replace every example
+origin, destination and token, then start it behind a TLS reverse proxy:
+
+```sh
+docker compose up -d --build
+```
+
+Expose `/health` and `/relay-node/v1` through HTTPS and `/tunnel` through WSS.
+Do not publish port 8080 directly to the public Internet unless an upstream
+proxy enforces TLS and rate limits.

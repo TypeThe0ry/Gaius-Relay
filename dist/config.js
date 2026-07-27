@@ -51,6 +51,6 @@ export function loadConfig() {
         maximumConnections: parseInteger("GAIUS_MAXIMUM_CONNECTIONS", 1024, 1, 100_000),
         maximumFrameBytes: parseInteger("GAIUS_MAXIMUM_FRAME_BYTES", 16 * 1024 * 1024, 1024, 16 * 1024 * 1024),
         proxyKeepAlives,
-        relayName: parseName("GAIUS_RELAY_NODE_NAME", "Gaius RelayNode"),
+        relayName: parseName("GAIUS_RELAY_NODE_NAME", "Gaius Translator Node"),
     };
 }

@@ -1,0 +1,12 @@
+services:
+  gaius-translator:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      GAIUS_ALLOWED_ORIGINS: "https://play.example"
+      GAIUS_ALLOWED_HOSTS: "mc.example.org,*.example.net"
+      GAIUS_BRIDGE_TOKEN: "runtime-generated-token"
+      GAIUS_MAXIMUM_CONNECTIONS: "256"
+      GAIUS_RELAY_NODE_NAME: "Example Gaius Translator"

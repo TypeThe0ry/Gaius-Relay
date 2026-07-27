@@ -27,7 +27,7 @@ const stalledClientTickGraceMs = 100;
 const localTunnelSessions = new Map();
 
 // A zero-compression keepalive is a complete 11-byte Minecraft frame. During a
-// large browser resource reload, acknowledging it in the RelayNode prevents a
+// large browser resource reload, acknowledging it in the translator node prevents a
 // backend read timeout without delaying arbitrary game packets. These ids are
 // from the 1.21.11 configuration and play protocol tables respectively.
 function proxyVanillaKeepAlive(socket, frame, playPhase) {
@@ -442,7 +442,7 @@ webSocketServer.on("connection", (webSocket) => {
     });
 });
 httpServer.listen(config.listenPort, config.listenHost, () => {
-    console.log(`Gaius RelayNode listening on http://${config.listenHost}:${config.listenPort}`);
+    console.log(`Gaius translator node listening on http://${config.listenHost}:${config.listenPort}`);
     console.log(`Allowed Minecraft hosts: ${config.allowedHosts.join(", ")}`);
     if (config.accessToken === undefined) {
         console.warn("GAIUS_BRIDGE_TOKEN is unset; this is acceptable only for local development.");

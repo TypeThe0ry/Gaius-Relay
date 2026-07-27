@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "WebSocket-to-TCP RelayNode for Gaius multiplayer",
+  "description": "WebSocket-to-TCP translator node for Gaius multiplayer",
   "engines": {
     "node": ">=22"
   },
