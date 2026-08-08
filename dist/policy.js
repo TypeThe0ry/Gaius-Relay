@@ -1,4 +1,6 @@
-import { isIP } from "node:net";
+import { BlockList, isIP } from "node:net";
+
+const privateNetworkBlockList = createPrivateNetworkBlockList();
 export function isOriginAllowed(origin, allowedOrigins) {
     if (origin === undefined) {
         return false;
@@ -25,6 +27,12 @@ export function normalizeHost(host) {
         return trimmed.slice(1, -1);
     }
     return trimmed.endsWith(".") ? trimmed.slice(0, -1) : trimmed;
+}
+export function isPrivateNetworkAddress(value) {
+    const normalized = normalizeHost(value);
+    const version = isIP(normalized);
+    return version !== 0 && privateNetworkBlockList.check(
+        normalized, version === 4 ? "ipv4" : "ipv6");
 }
 export function parseConnectRequest(text) {
     const value = JSON.parse(text);
@@ -91,4 +99,40 @@ function isValidDnsName(host) {
     return host.split(".").every((label) => label.length >= 1 &&
         label.length <= 63 &&
         /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u.test(label));
+}
+function createPrivateNetworkBlockList() {
+    const blockList = new BlockList();
+    for (const [network, prefix] of [
+        ["0.0.0.0", 8],
+        ["10.0.0.0", 8],
+        ["100.64.0.0", 10],
+        ["127.0.0.0", 8],
+        ["169.254.0.0", 16],
+        ["172.16.0.0", 12],
+        ["192.0.0.0", 24],
+        ["192.0.2.0", 24],
+        ["192.168.0.0", 16],
+        ["198.18.0.0", 15],
+        ["198.51.100.0", 24],
+        ["203.0.113.0", 24],
+        ["224.0.0.0", 4],
+        ["240.0.0.0", 4],
+    ]) {
+        blockList.addSubnet(network, prefix, "ipv4");
+    }
+    for (const [network, prefix] of [
+        ["::", 128],
+        ["::1", 128],
+        ["64:ff9b:1::", 48],
+        ["100::", 64],
+        ["2001:db8::", 32],
+        ["2001:10::", 28],
+        ["2001:20::", 28],
+        ["fc00::", 7],
+        ["fe80::", 10],
+        ["ff00::", 8],
+    ]) {
+        blockList.addSubnet(network, prefix, "ipv6");
+    }
+    return blockList;
 }

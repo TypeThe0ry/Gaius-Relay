@@ -1,0 +1,16 @@
+{$GAIUS_RELAY_DOMAIN} {
+	reverse_proxy gaius-relay:8080
+}
+
+{$GAIUS_REGISTRY_DOMAIN} {
+	@public_registry {
+		method GET HEAD OPTIONS
+		path /relay-nodes.json /health
+	}
+	handle @public_registry {
+		reverse_proxy gaius-registry:8083
+	}
+	handle {
+		respond "Not found" 404
+	}
+}

@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node dist/main.js",
-    "smoke": "node multiplayer-smoke.mjs"
+    "start:registry": "node dist/registry.js",
+    "smoke": "node multiplayer-smoke.mjs && node registry-smoke.mjs && node local-relay/scripts/browser-relay-routing-smoke.mjs"
   },
   "dependencies": {
     "ws": "^8.21.0"
