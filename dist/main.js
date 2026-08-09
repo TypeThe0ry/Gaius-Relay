@@ -12,6 +12,21 @@ import { loadConfig } from "./config.js";
 import { isHostAllowed, isOriginAllowed, isPrivateNetworkAddress, normalizeHost, parseConnectRequest, } from "./policy.js";
 const config = loadConfig();
 const traceTunnel = process.env.GAIUS_TRACE_TUNNEL === "1";
+const dnsTestScenario = process.env.NODE_ENV === "test"
+    ? {
+        lookupHost: process.env.GAIUS_DNS_TEST_LOOKUP_HOST,
+        lookupPermanentHost: process.env.GAIUS_DNS_TEST_LOOKUP_PERMANENT_HOST,
+        lookupAddress: process.env.GAIUS_DNS_TEST_LOOKUP_ADDRESS ?? "127.0.0.1",
+        lookupFailures: parseDnsTestInteger(process.env.GAIUS_DNS_TEST_LOOKUP_FAILURES),
+        srvHost: process.env.GAIUS_DNS_TEST_SRV_HOST,
+        srvPermanentHost: process.env.GAIUS_DNS_TEST_SRV_PERMANENT_HOST,
+        srvTarget: process.env.GAIUS_DNS_TEST_SRV_TARGET ?? "127.0.0.1",
+        srvPort: parseDnsTestInteger(process.env.GAIUS_DNS_TEST_SRV_PORT),
+        srvFailures: parseDnsTestInteger(process.env.GAIUS_DNS_TEST_SRV_FAILURES),
+    }
+    : undefined;
+let dnsTestLookupAttempts = 0;
+let dnsTestSrvAttempts = 0;
 const relayNodeProtocolVersion = 1;
 const relayNodeManifestPath = "/relay-node/v1";
 const maximumResourcePackBytes = 250 * 1024 * 1024;
@@ -34,6 +49,7 @@ const relayCapabilities = [
     "resource-pack-proxy",
     "resource-pack-cache",
     "public-target-guard",
+    "target-attestation",
 ];
 // `ServerboundClientTickEndPacket` is emitted once per client tick in 1.21.11.
 // A resource/model reload can temporarily stop browser ticks, while a spawn
@@ -42,6 +58,12 @@ const relayCapabilities = [
 // PLAY, then switches to the exact frame observed from the browser.
 const stalledClientTickIntervalMs = 50;
 const stalledClientTickGraceMs = 100;
+
+function parseDnsTestInteger(value) {
+    const parsed = Number.parseInt(value ?? "", 10);
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
 const localTunnelSessions = new Map();
 const targetRoutes = new Map();
 const resourcePackCache = new Map();
@@ -57,9 +79,11 @@ const relayRegistrationState = {
     lastSuccessAt: 0,
     lastError: null,
 };
+let stopRelayRegistration = async () => {};
+let shutdownStarted = false;
 process.once("exit", cleanupResourcePackTemporaryFiles);
-process.once("SIGINT", () => process.exit(130));
-process.once("SIGTERM", () => process.exit(143));
+process.once("SIGINT", () => void shutdownRelayNode(130));
+process.once("SIGTERM", () => void shutdownRelayNode(143));
 
 function targetRouteKey(host, port) {
     const normalized = normalizeHost(host);
@@ -439,6 +463,8 @@ webSocketServer.on("connection", (webSocket) => {
             webSocket.send(JSON.stringify({
                 type: "connecting",
                 targetConnectTimeoutMs: config.connectTimeoutMs,
+                host: request.host,
+                port: request.port,
             }));
             openTcpTunnel(request, tunnelConnectAbortController.signal)
                 .then((socket) => {
@@ -452,7 +478,16 @@ webSocketServer.on("connection", (webSocket) => {
                 tcpSocket.setTimeout(0);
                 releaseTargetRoute = acquireTargetRoute(request);
                 connected = true;
-                webSocket.send(JSON.stringify({ type: "connected" }));
+                const candidate = tcpSocket.gaiusTarget ?? request;
+                webSocket.send(JSON.stringify({
+                    type: "connected",
+                    host: request.host,
+                    port: request.port,
+                    candidateHost: candidate.host,
+                    candidatePort: candidate.port,
+                    remoteAddress: tcpSocket.remoteAddress ?? null,
+                    remotePort: tcpSocket.remotePort ?? null,
+                }));
                 tcpSocket.on("data", (chunk) => {
                     traceTunnelEvent(
                         `server data ${request.host}:${request.port} bytes=${chunk.byteLength} `
@@ -679,62 +714,119 @@ function startRelayRegistration() {
     const leaseUrl = new URL(encodeURIComponent(registration.nodeId), registration.registryUrl);
     let requestRunning = false;
     let announced = false;
-    const register = async () => {
-        if (requestRunning) {
-            return;
+    let stopped = false;
+    let activeController;
+    let activeRequest = Promise.resolve();
+    const register = () => {
+        if (requestRunning || stopped) {
+            return activeRequest;
         }
         requestRunning = true;
         relayRegistrationState.attempts++;
         relayRegistrationState.lastAttemptAt = Date.now();
         const controller = new AbortController();
+        activeController = controller;
         const timeout = setTimeout(
             () => controller.abort(), Math.min(10_000, registration.intervalMs));
+        activeRequest = (async () => {
+            try {
+                const response = await fetch(leaseUrl, {
+                    method: "PUT",
+                    headers: {
+                        authorization: `Bearer ${registration.token}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        kind: "gaius-relay-registration",
+                        protocolVersion: relayNodeProtocolVersion,
+                        id: registration.nodeId,
+                        name: config.relayName,
+                        url: registration.publicUrl,
+                        priority: registration.priority,
+                    }),
+                    signal: controller.signal,
+                });
+                if (!response.ok) {
+                    const detail = (await response.text()).slice(0, 240);
+                    throw new Error(`registry returned ${response.status}: ${detail}`);
+                }
+                relayRegistrationState.registered = true;
+                relayRegistrationState.successes++;
+                relayRegistrationState.lastSuccessAt = Date.now();
+                relayRegistrationState.lastError = null;
+                if (!announced) {
+                    announced = true;
+                    console.log(
+                        `RelayNode registered as ${registration.nodeId} at ${registration.registryUrl}`);
+                }
+            }
+            catch (error) {
+                relayRegistrationState.registered = false;
+                if (!stopped) {
+                    relayRegistrationState.failures++;
+                    relayRegistrationState.lastError = String(
+                        error instanceof Error ? error.message : error).slice(0, 240);
+                    console.warn("RelayNode registration failed:", relayRegistrationState.lastError);
+                }
+            }
+            finally {
+                clearTimeout(timeout);
+                if (activeController === controller) {
+                    activeController = undefined;
+                }
+                requestRunning = false;
+            }
+        })();
+        return activeRequest;
+    };
+    void register();
+    const timer = setInterval(() => void register(), registration.intervalMs);
+    timer.unref();
+    stopRelayRegistration = async () => {
+        if (stopped) {
+            return;
+        }
+        stopped = true;
+        clearInterval(timer);
+        activeController?.abort();
+        await activeRequest;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 2_000);
         try {
             const response = await fetch(leaseUrl, {
-                method: "PUT",
-                headers: {
-                    authorization: `Bearer ${registration.token}`,
-                    "content-type": "application/json",
-                },
-                body: JSON.stringify({
-                    kind: "gaius-relay-registration",
-                    protocolVersion: relayNodeProtocolVersion,
-                    id: registration.nodeId,
-                    name: config.relayName,
-                    url: registration.publicUrl,
-                    priority: registration.priority,
-                }),
+                method: "DELETE",
+                headers: { authorization: `Bearer ${registration.token}` },
                 signal: controller.signal,
             });
-            if (!response.ok) {
-                const detail = (await response.text()).slice(0, 240);
-                throw new Error(`registry returned ${response.status}: ${detail}`);
+            if (!response.ok && response.status !== 404) {
+                throw new Error(`registry returned ${response.status}`);
             }
-            relayRegistrationState.registered = true;
-            relayRegistrationState.successes++;
-            relayRegistrationState.lastSuccessAt = Date.now();
-            relayRegistrationState.lastError = null;
-            if (!announced) {
-                announced = true;
-                console.log(
-                    `RelayNode registered as ${registration.nodeId} at ${registration.registryUrl}`);
-            }
-        }
-        catch (error) {
             relayRegistrationState.registered = false;
-            relayRegistrationState.failures++;
-            relayRegistrationState.lastError = String(
-                error instanceof Error ? error.message : error).slice(0, 240);
-            console.warn("RelayNode registration failed:", relayRegistrationState.lastError);
+            console.log(`RelayNode unregistered as ${registration.nodeId}`);
         }
         finally {
             clearTimeout(timeout);
-            requestRunning = false;
         }
     };
-    void register();
-    const timer = setInterval(register, registration.intervalMs);
-    timer.unref();
+}
+async function shutdownRelayNode(code) {
+    if (shutdownStarted) {
+        return;
+    }
+    shutdownStarted = true;
+    const forcedExit = setTimeout(() => process.exit(code), 3_000);
+    try {
+        await stopRelayRegistration();
+    }
+    catch (error) {
+        console.warn("RelayNode unregister failed:", error instanceof Error ? error.message : error);
+    }
+    for (const client of webSocketServer.clients) {
+        client.terminate();
+    }
+    await new Promise((resolve) => httpServer.close(resolve));
+    clearTimeout(forcedExit);
+    process.exit(code);
 }
 async function openTcpTunnel(request, signal) {
     const targets = await resolveMinecraftTargets(request);
@@ -761,7 +853,7 @@ async function resolveMinecraftTargets(request) {
         return [request];
     }
     try {
-        const records = await resolveSrv(`_minecraft._tcp.${request.host}`);
+        const records = await resolveSrvWithRetries(`_minecraft._tcp.${request.host}`);
         if (records.length === 0) {
             return [request];
         }
@@ -777,6 +869,28 @@ async function resolveMinecraftTargets(request) {
     catch {
         return [request];
     }
+}
+async function resolveSrvWithRetries(hostname) {
+    return withDnsRetries(`SRV ${hostname}`, async () => {
+        if (dnsTestScenario?.srvHost !== undefined &&
+            hostname === `_minecraft._tcp.${dnsTestScenario.srvHost}`) {
+            dnsTestSrvAttempts++;
+            if (dnsTestSrvAttempts <= dnsTestScenario.srvFailures) {
+                throw createDnsTestError("EAI_AGAIN", hostname);
+            }
+            return [{
+                    priority: 0,
+                    weight: 0,
+                    port: dnsTestScenario.srvPort,
+                    name: dnsTestScenario.srvTarget,
+                }];
+        }
+        if (dnsTestScenario?.srvPermanentHost !== undefined &&
+            hostname === `_minecraft._tcp.${dnsTestScenario.srvPermanentHost}`) {
+            throw createDnsTestError("ENOTFOUND", hostname);
+        }
+        return resolveSrv(hostname);
+    });
 }
 function orderSrvRecords(records) {
     const priorities = [...new Set(records.map((record) => record.priority))]
@@ -841,6 +955,7 @@ function connectTcpTarget(target, signal) {
             settled = true;
             cleanup();
             socket.setTimeout(0);
+            socket.gaiusTarget = target;
             resolve(socket);
         };
         if (signal.aborted) {
@@ -859,11 +974,7 @@ function publicTargetLookup(host, options, callback) {
     const lookupOptions = typeof options === "object" && options !== null
         ? {...options, all: true}
         : {family: options, all: true};
-    dnsLookup(host, lookupOptions, (error, addresses) => {
-        if (error !== null) {
-            callback(error);
-            return;
-        }
+    void lookupDnsWithRetries(host, lookupOptions).then(({addresses}) => {
         const publicAddresses = addresses.filter(
             (entry) => !isPrivateNetworkAddress(entry.address));
         if (publicAddresses.length === 0) {
@@ -878,7 +989,68 @@ function publicTargetLookup(host, options, callback) {
         else {
             callback(null, publicAddresses[0].address, publicAddresses[0].family);
         }
+    }, (error) => callback(error));
+}
+async function lookupDnsWithRetries(host, options) {
+    return withDnsRetries(`lookup ${host}`, () => lookupDns(host, options));
+}
+function lookupDns(host, options) {
+    if (dnsTestScenario?.lookupHost === host) {
+        dnsTestLookupAttempts++;
+        if (dnsTestLookupAttempts <= dnsTestScenario.lookupFailures) {
+            return Promise.reject(createDnsTestError("EAI_AGAIN", host));
+        }
+        return Promise.resolve({
+            addresses: [{ address: dnsTestScenario.lookupAddress, family: 4 }],
+            family: 4,
+        });
+    }
+    if (dnsTestScenario?.lookupPermanentHost === host) {
+        return Promise.reject(createDnsTestError("ENOTFOUND", host));
+    }
+    return new Promise((resolve, reject) => {
+        dnsLookup(host, options, (error, addresses, family) => {
+            if (error !== null) {
+                reject(error);
+                return;
+            }
+            resolve({addresses, family});
+        });
     });
+}
+async function withDnsRetries(label, operation) {
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await operation();
+        }
+        catch (error) {
+            if (!isTransientDnsError(error) || attempt >= config.dnsRetryAttempts) {
+                throw error;
+            }
+            const retryNumber = attempt + 1;
+            const code = error instanceof Error && "code" in error
+                ? String(error.code)
+                : "unknown";
+            console.warn(
+                `DNS ${label} transient error ${code}; retry ${retryNumber}/${config.dnsRetryAttempts}`
+            );
+            const delayMs = config.dnsRetryDelayMs * retryNumber;
+            if (delayMs > 0) {
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+        }
+    }
+}
+function isTransientDnsError(error) {
+    const code = error !== null && typeof error === "object" && "code" in error
+        ? String(error.code)
+        : "";
+    return ["EAI_AGAIN", "ETIMEOUT", "ESERVFAIL", "EAI_FAIL", "EAI_SYSTEM"].includes(code);
+}
+function createDnsTestError(code, host) {
+    const error = new Error(`${code} resolving ${host}`);
+    error.code = code;
+    return error;
 }
 function isLiteralAddress(host) {
     return /^\d{1,3}(?:\.\d{1,3}){3}$/u.test(host) || host.includes(":");

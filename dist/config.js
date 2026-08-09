@@ -122,6 +122,8 @@ export function loadConfig() {
             allowedHosts),
         ...(accessToken === undefined ? {} : { accessToken }),
         connectTimeoutMs: parseInteger("GAIUS_CONNECT_TIMEOUT_MS", 10_000, 100, 60_000),
+        dnsRetryAttempts: parseInteger("GAIUS_DNS_RETRY_ATTEMPTS", 2, 0, 3),
+        dnsRetryDelayMs: parseInteger("GAIUS_DNS_RETRY_DELAY_MS", 75, 0, 500),
         idleTimeoutMs: parseInteger("GAIUS_IDLE_TIMEOUT_MS", 10 * 60_000, 1_000, 3_600_000),
         maximumConnections: parseInteger("GAIUS_MAXIMUM_CONNECTIONS", 1024, 1, 100_000),
         maximumFrameBytes: parseInteger("GAIUS_MAXIMUM_FRAME_BYTES", 16 * 1024 * 1024, 1024, 16 * 1024 * 1024),

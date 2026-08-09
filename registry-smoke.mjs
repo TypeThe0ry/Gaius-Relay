@@ -10,6 +10,20 @@ const relayPort = await reservePort();
 const registryBase = `http://127.0.0.1:${registryPort}`;
 const registryNodesUrl = `${registryBase}/relay-registry/v1/nodes/`;
 const relayUrl = `ws://127.0.0.1:${relayPort}/tunnel`;
+const relayEnvironment = {
+    GAIUS_BRIDGE_HOST: "127.0.0.1",
+    GAIUS_BRIDGE_PORT: String(relayPort),
+    GAIUS_ALLOWED_ORIGINS: "null",
+    GAIUS_ALLOWED_HOSTS: "127.0.0.1",
+    GAIUS_RELAY_NODE_NAME: "Registry smoke RelayNode",
+    GAIUS_RELAY_REGISTRY_URL: registryNodesUrl,
+    GAIUS_RELAY_REGISTRY_TOKEN: registryToken,
+    GAIUS_RELAY_PUBLIC_URL: relayUrl,
+    GAIUS_RELAY_NODE_ID: "registry-smoke",
+    GAIUS_RELAY_PRIORITY: "42",
+    GAIUS_RELAY_REGISTRATION_INTERVAL_MS: "1000",
+    GAIUS_RELAY_ALLOW_INSECURE_REGISTRATION: "1",
+};
 let registry;
 let relay;
 let guardedRelay;
@@ -27,20 +41,7 @@ try {
         () => registry.output.includes("relay registry listening"),
         "relay registry startup");
 
-    relay = startNode("dist/main.js", {
-        GAIUS_BRIDGE_HOST: "127.0.0.1",
-        GAIUS_BRIDGE_PORT: String(relayPort),
-        GAIUS_ALLOWED_ORIGINS: "null",
-        GAIUS_ALLOWED_HOSTS: "127.0.0.1",
-        GAIUS_RELAY_NODE_NAME: "Registry smoke RelayNode",
-        GAIUS_RELAY_REGISTRY_URL: registryNodesUrl,
-        GAIUS_RELAY_REGISTRY_TOKEN: registryToken,
-        GAIUS_RELAY_PUBLIC_URL: relayUrl,
-        GAIUS_RELAY_NODE_ID: "registry-smoke",
-        GAIUS_RELAY_PRIORITY: "42",
-        GAIUS_RELAY_REGISTRATION_INTERVAL_MS: "1000",
-        GAIUS_RELAY_ALLOW_INSECURE_REGISTRATION: "1",
-    }, ["GAIUS_BRIDGE_TOKEN"]);
+    relay = startNode("dist/main.js", relayEnvironment, ["GAIUS_BRIDGE_TOKEN"]);
     await waitFor(
         () => relay.output.includes("RelayNode registered as registry-smoke"),
         "RelayNode registration");
@@ -78,6 +79,24 @@ try {
     discovered = await fetchJson(`${registryBase}/relay-nodes.json`);
     assert(discovered.nodes.length === 1,
         "RelayNode lease expired while registration heartbeats were active");
+
+    const gracefulStopStartedAt = Date.now();
+    relay.child.kill("SIGTERM");
+    const gracefulExitCode = await relay.exited;
+    assert(gracefulExitCode === 143, "RelayNode did not complete graceful SIGTERM shutdown");
+    relay = undefined;
+    await waitFor(async () => {
+        const value = await fetchJson(`${registryBase}/relay-nodes.json`);
+        return value.nodes.length === 0;
+    }, "gracefully removed RelayNode lease", 2000);
+    const gracefulUnregisterMs = Date.now() - gracefulStopStartedAt;
+    assert(gracefulUnregisterMs < 2500,
+        "RelayNode waited for lease expiry instead of unregistering during shutdown");
+
+    relay = startNode("dist/main.js", relayEnvironment, ["GAIUS_BRIDGE_TOKEN"]);
+    await waitFor(
+        () => relay.output.includes("RelayNode registered as registry-smoke"),
+        "RelayNode re-registration after graceful shutdown");
 
     const rejected = await fetch(
         `${registryBase}/relay-registry/v1/nodes/unauthorized`, {
@@ -142,6 +161,7 @@ try {
         relayUrl,
         acceptedRegistrations: health.acceptedRegistrations,
         rejectedRegistrations: health.rejectedRegistrations,
+        gracefulUnregisterMs,
         expiredAfterCrash: true,
         privateTargetDenied: true,
         privateTargetVariantsDenied: privateTargets.length,
@@ -227,7 +247,8 @@ async function waitFor(predicate, label, timeoutMs = 5000) {
     while (true) {
         if (await predicate()) return;
         if (Date.now() >= deadline) {
-            const details = [registry?.output, relay?.output].filter(Boolean).join("\n");
+            const details = [registry?.output, relay?.output, guardedRelay?.output]
+                .filter(Boolean).join("\n");
             throw new Error(`Timed out waiting for ${label}\n${details}`);
         }
         await delay(25);

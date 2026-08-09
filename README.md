@@ -85,6 +85,10 @@ The browser retains a failed direct-plugin probe for 30 seconds and successful
 RelayNode manifest results for 15 seconds. This removes the repeated discovery
 delay between a server-list ping and the subsequent join without reusing their
 WebSocket or TCP streams.
+The initial same-host WebSocket probe remains bounded to 800 milliseconds. A
+current Gaius server plugin immediately returns `connecting` with its configured
+TCP timeout, at which point the browser extends only that live direct attempt.
+Older plugins remain compatible and use the original short probe behavior.
 
 Affinity only reuses the selected RelayNode. Every browser channel still opens
 its own WebSocket and its own Minecraft TCP connection; protocol streams are
@@ -109,7 +113,9 @@ leased live registry, a custom `relayRegistry`, `gaius.bridgeNodes`, or a
 `bridge` query parameter. The portable HTML embeds the registry snapshot and
 refreshes it from GitHub when it has network access. A root registry can point
 to a live registry, so contributors can renew short leases without rebuilding
-the client. The client discovers which node already has affinity for the
+the client. A RelayNode removes its lease during normal SIGINT/SIGTERM shutdown;
+the registry TTL remains the fallback for crashes or network partitions. The
+client discovers which node already has affinity for the
 entered server and opens a new isolated tunnel there; if none does, it selects
 an available node and establishes the first tunnel. See
 [`docs/relay-nodes.md`](../../docs/relay-nodes.md) for the contribution and
@@ -132,6 +138,23 @@ Run the focused protocol test with:
 ```sh
 npm run smoke
 ```
+
+Verify the public node separately against a real Java server without making
+external network availability a CI requirement:
+
+```sh
+npm run smoke:public
+GAIUS_PUBLIC_RELAY_TARGET=example.org:25565 npm run smoke:public
+```
+
+The public smoke uses the first node in the root `relay-nodes.json` unless
+`GAIUS_PUBLIC_RELAY_URL` is set. It sends the same `Origin: null` as the
+downloaded HTML, opens an isolated tunnel, completes a Minecraft status query,
+closes the WebSocket, and verifies that the target lease is released. On hosts
+whose local proxy exposes DNS through the reserved `198.18.0.0/15` fake-IP
+range, the smoke resolves only the RelayNode hostname through DNS-over-HTTPS
+while preserving TLS hostname verification. `GAIUS_PUBLIC_RELAY_EDGE_IP` can
+be used as an explicit diagnostic override.
 
 The smoke test injects two interrupted 20 MiB resource-pack responses, requires
 the third response to reach the client with its original SHA-1, verifies a
