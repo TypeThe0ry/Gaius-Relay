@@ -11,6 +11,7 @@ import { WebSocket, WebSocketServer, } from "ws";
 import { loadConfig } from "./config.js";
 import { isHostAllowed, isOriginAllowed, isPrivateNetworkAddress, normalizeHost, parseConnectRequest, } from "./policy.js";
 import { resolveMinecraftProfile } from "./protocol.js";
+import { MinecraftFrameAccumulator } from "./framed-stream.js";
 const config = loadConfig();
 const traceTunnel = process.env.GAIUS_TRACE_TUNNEL === "1";
 const dnsTestScenario = process.env.NODE_ENV === "test"
@@ -101,6 +102,9 @@ const serverFrameTelemetry = {
     dataCallbacksAtPause: 0,
     dataCallbacksAtDrainStart: 0,
     dataCallbacksAtDrainCompletion: 0,
+    appendedChunks: 0,
+    coalescedFrames: 0,
+    coalescedBytes: 0,
     retainedCompleteFrames: 0,
     maxRetainedCompleteFrames: 0,
     pauses: 0,
@@ -109,6 +113,11 @@ const serverFrameTelemetry = {
     maxBufferedAmount: 0,
     bufferedFrameBytes: 0,
     maxBufferedFrameBytes: 0,
+};
+const clientFrameTelemetry = {
+    appendedChunks: 0,
+    coalescedFrames: 0,
+    coalescedBytes: 0,
 };
 const serverFrameForwardResult = Object.freeze({
     ENQUEUED: "enqueued",
@@ -489,6 +498,12 @@ function relayRuntimeSnapshot() {
         serverFrameDataCallbacksAtDrainStart: serverFrameTelemetry.dataCallbacksAtDrainStart,
         serverFrameDataCallbacksAtDrainCompletion:
             serverFrameTelemetry.dataCallbacksAtDrainCompletion,
+        serverFrameAppendedChunks: serverFrameTelemetry.appendedChunks,
+        serverFrameCoalescedFrames: serverFrameTelemetry.coalescedFrames,
+        serverFrameCoalescedBytes: serverFrameTelemetry.coalescedBytes,
+        clientFrameAppendedChunks: clientFrameTelemetry.appendedChunks,
+        clientFrameCoalescedFrames: clientFrameTelemetry.coalescedFrames,
+        clientFrameCoalescedBytes: clientFrameTelemetry.coalescedBytes,
         serverFrameBufferedCompleteFrames: serverFrameTelemetry.retainedCompleteFrames,
         serverFrameMaxBufferedCompleteFrames: serverFrameTelemetry.maxRetainedCompleteFrames,
         serverFramePauses: serverFrameTelemetry.pauses,
@@ -570,14 +585,14 @@ webSocketServer.on("connection", (webSocket) => {
     let serverFrameDrainHoldingRead = false;
     let protocolPhase = "login";
     let configurationCycles = 0;
-    let serverFrameBuffer = Buffer.alloc(0);
+    const serverFrameBuffer = new MinecraftFrameAccumulator(config.maximumFrameBytes);
     let serverFrameRetainedCompleteFrames = 0;
     let serverFrameInFlightFrameBytes = 0;
     let serverFrameDrainHandle;
     let serverFrameDrainScheduled = false;
     let serverFrameDrainRunning = false;
     let serverFrameDrainRescheduleRequested = false;
-    let clientFrameBuffer = Buffer.alloc(0);
+    const clientFrameBuffer = new MinecraftFrameAccumulator(config.maximumFrameBytes);
     let minecraftHandshakeBuffer = Buffer.alloc(0);
     // The first Minecraft handshake selects the packet-id table. Do not assume
     // the legacy table before that handshake: an unknown or malformed profile
@@ -740,23 +755,7 @@ webSocketServer.on("connection", (webSocket) => {
         if (!packetFramingEnabled) {
             return 0;
         }
-        let remaining = serverFrameBuffer;
-        let count = 0;
-        let inFlightBytes = serverFrameInFlightFrameBytes;
-        while (remaining.byteLength > 0) {
-            const parsed = readMinecraftFrame(remaining);
-            if (parsed === undefined || parsed === null) {
-                break;
-            }
-            if (inFlightBytes > 0) {
-                inFlightBytes -= parsed.frame.byteLength;
-                remaining = parsed.remainder;
-                continue;
-            }
-            count++;
-            remaining = parsed.remainder;
-        }
-        return count;
+        return serverFrameBuffer.countCompleteFrames(serverFrameInFlightFrameBytes);
     };
     const updateRetainedCompleteFrameTelemetry = (next = countCompleteServerFrames()) => {
         const nextCount = Number.isInteger(next) && next >= 0 ? next : 0;
@@ -776,25 +775,49 @@ webSocketServer.on("connection", (webSocket) => {
             serverFrameTelemetry.retainedCompleteFrames,
         );
     };
-    const replaceServerFrameBuffer = (next) => {
-        const nextBuffer = next.byteLength === 0 ? Buffer.alloc(0) : next;
-        const aggregate = serverFrameTelemetry.bufferedFrameBytes +
-            nextBuffer.byteLength - serverFrameBuffer.byteLength;
-        if (aggregate < 0) {
-            // A close callback can race a final drain callback. Keep the gauge
-            // usable, but expose the invariant violation instead of hiding it.
-            serverFrameTelemetry.bufferedUnderflows++;
-            serverFrameTelemetry.bufferedUnderflowBytes += -aggregate;
-            serverFrameTelemetry.bufferedFrameBytes = 0;
-        }
-        else {
-            serverFrameTelemetry.bufferedFrameBytes = aggregate;
-        }
-        serverFrameBuffer = nextBuffer;
+    const syncServerFrameBufferTelemetry = () => {
+        // The accumulator is the source of truth; consume/append operations
+        // are committed only after ownership of a frame changes hands.
+        serverFrameTelemetry.bufferedFrameBytes = serverFrameBuffer.byteLength;
         serverFrameTelemetry.maxBufferedFrameBytes = Math.max(
             serverFrameTelemetry.maxBufferedFrameBytes,
             serverFrameTelemetry.bufferedFrameBytes,
         );
+    };
+    const appendServerFrameBuffer = (chunk) => {
+        const beforeChunks = serverFrameBuffer.appendedChunks;
+        serverFrameBuffer.append(chunk);
+        if (serverFrameBuffer.appendedChunks !== beforeChunks) {
+            serverFrameTelemetry.appendedChunks +=
+                serverFrameBuffer.appendedChunks - beforeChunks;
+        }
+        syncServerFrameBufferTelemetry();
+    };
+    const consumeServerFrameBuffer = (bytes) => {
+        serverFrameBuffer.consume(bytes);
+        syncServerFrameBufferTelemetry();
+    };
+    const clearServerFrameBuffer = () => {
+        serverFrameBuffer.clear();
+        syncServerFrameBufferTelemetry();
+    };
+    const observeServerFrameCoalescing = (parsed) => {
+        if (parsed?.coalesced === true) {
+            serverFrameTelemetry.coalescedFrames++;
+            serverFrameTelemetry.coalescedBytes += parsed.frameBytes;
+        }
+    };
+    const appendClientFrameBuffer = (chunk) => {
+        const beforeChunks = clientFrameBuffer.appendedChunks;
+        clientFrameBuffer.append(chunk);
+        clientFrameTelemetry.appendedChunks +=
+            clientFrameBuffer.appendedChunks - beforeChunks;
+    };
+    const observeClientFrameCoalescing = (parsed) => {
+        if (parsed?.coalesced === true) {
+            clientFrameTelemetry.coalescedFrames++;
+            clientFrameTelemetry.coalescedBytes += parsed.frameBytes;
+        }
     };
     const observeWebSocketBufferedAmount = () => {
         const bufferedAmount = Number(webSocket.bufferedAmount);
@@ -888,7 +911,7 @@ webSocketServer.on("connection", (webSocket) => {
             serverFrameTelemetry.cleanupBytes += serverFrameBuffer.byteLength;
         }
         updateRetainedCompleteFrameTelemetry(0);
-        replaceServerFrameBuffer(Buffer.alloc(0));
+        clearServerFrameBuffer();
         tcpPausedForWebSocket = false;
         serverFrameDrainHoldingRead = false;
     };
@@ -1020,21 +1043,24 @@ webSocketServer.on("connection", (webSocket) => {
                         while (serverFrameBuffer.byteLength > 0 &&
                             !tcpPausedForWebSocket && !tcpPausedForClient && !tunnelCancelled) {
                             if (!packetFramingEnabled) {
-                                const opaqueChunk = serverFrameBuffer;
+                                const opaqueChunk = serverFrameBuffer.peekChunk();
+                                if (opaqueChunk === undefined) {
+                                    break;
+                                }
                                 if (proxyVanillaKeepAlive(
                                     tcpSocket,
                                     opaqueChunk,
                                     protocolPhase,
                                     minecraftProfile,
                                 )) {
-                                    replaceServerFrameBuffer(Buffer.alloc(0));
+                                    consumeServerFrameBuffer(opaqueChunk.byteLength);
                                     continue;
                                 }
                                 const result = forwardServerFrame(opaqueChunk);
                                 if (isEnqueuedServerFrameResult(result)) {
                                     // Ownership transfers to ws only after
                                     // send() accepted the bytes.
-                                    replaceServerFrameBuffer(Buffer.alloc(0));
+                                    consumeServerFrameBuffer(opaqueChunk.byteLength);
                                 }
                                 else if (result === serverFrameForwardResult.CLOSED ||
                                     result === serverFrameForwardResult.ERROR) {
@@ -1045,7 +1071,7 @@ webSocketServer.on("connection", (webSocket) => {
                                 }
                                 continue;
                             }
-                            const parsed = readMinecraftFrame(serverFrameBuffer);
+                            const parsed = serverFrameBuffer.peekFrame();
                             if (parsed === undefined) {
                                 break;
                             }
@@ -1057,55 +1083,22 @@ webSocketServer.on("connection", (webSocket) => {
                                 minecraftProfile = undefined;
                                 clearClientStallTimer();
                                 traceTunnelEvent("disabled keepalive proxy for opaque server traffic");
-                                const opaqueChunk = serverFrameBuffer;
-                                const result = forwardServerFrame(opaqueChunk);
-                                if (isEnqueuedServerFrameResult(result)) {
-                                    replaceServerFrameBuffer(Buffer.alloc(0));
-                                }
-                                else if (result === serverFrameForwardResult.CLOSED ||
-                                    result === serverFrameForwardResult.ERROR) {
-                                    clearServerFrameState();
-                                }
-                                break;
+                                // Keep the accumulator intact and let the next
+                                // loop iteration forward its original chunks.
+                                continue;
                             }
-                            if (traceTunnel && protocolPhase === "play") {
-                                const packet = minecraftPacketId(parsed.frame, parsed.headerBytes);
-                                if (packet !== undefined) {
-                                    lastServerPlayPacket =
-                                        `0x${packet.id.toString(16)}/${parsed.frame.byteLength}`;
-                                }
-                            }
-                            if (protocolPhase === "play" &&
-                                isPayloadlessPacket(
-                                    parsed.frame,
-                                    parsed.headerBytes,
-                                    minecraftProfile.play.clientboundStartConfiguration,
-                                )) {
-                                protocolPhase = "reconfiguring";
-                                clearClientStallTimer();
-                                traceTunnelEvent("server started PLAY to CONFIGURATION transition");
-                            }
-                            if (isLoginEncryptionRequest(parsed.frame, parsed.headerBytes)) {
-                                encryptionResponsePending = true;
-                            }
-                            traceCustomPayload(
-                                parsed.frame,
-                                parsed.headerBytes,
-                                "server",
-                                protocolPhase === "play",
-                                minecraftProfile,
-                            );
                             if (proxyVanillaKeepAlive(
                                 tcpSocket,
                                 parsed.frame,
                                 protocolPhase,
                                 minecraftProfile,
                             )) {
-                                replaceServerFrameBuffer(parsed.remainder);
+                                observeServerFrameCoalescing(parsed);
+                                consumeServerFrameBuffer(parsed.frameBytes);
                                 continue;
                             }
                             let result;
-                            serverFrameInFlightFrameBytes = parsed.frame.byteLength;
+                            serverFrameInFlightFrameBytes = parsed.frameBytes;
                             try {
                                 result = forwardServerFrame(parsed.frame);
                             }
@@ -1113,9 +1106,37 @@ webSocketServer.on("connection", (webSocket) => {
                                 serverFrameInFlightFrameBytes = 0;
                             }
                             if (isEnqueuedServerFrameResult(result)) {
-                                // Do not drop parsed.remainder until the
+                                // Do not consume the deque entry until the
                                 // frame itself is confirmed enqueued.
-                                replaceServerFrameBuffer(parsed.remainder);
+                                observeServerFrameCoalescing(parsed);
+                                consumeServerFrameBuffer(parsed.frameBytes);
+                                if (traceTunnel && protocolPhase === "play") {
+                                    const packet = minecraftPacketId(parsed.frame, parsed.headerBytes);
+                                    if (packet !== undefined) {
+                                        lastServerPlayPacket =
+                                            `0x${packet.id.toString(16)}/${parsed.frame.byteLength}`;
+                                    }
+                                }
+                                if (protocolPhase === "play" &&
+                                    isPayloadlessPacket(
+                                        parsed.frame,
+                                        parsed.headerBytes,
+                                        minecraftProfile.play.clientboundStartConfiguration,
+                                    )) {
+                                    protocolPhase = "reconfiguring";
+                                    clearClientStallTimer();
+                                    traceTunnelEvent("server started PLAY to CONFIGURATION transition");
+                                }
+                                if (isLoginEncryptionRequest(parsed.frame, parsed.headerBytes)) {
+                                    encryptionResponsePending = true;
+                                }
+                                traceCustomPayload(
+                                    parsed.frame,
+                                    parsed.headerBytes,
+                                    "server",
+                                    protocolPhase === "play",
+                                    minecraftProfile,
+                                );
                             }
                             else if (result === serverFrameForwardResult.PAUSED) {
                                 // The complete frame and its remainder are
@@ -1185,9 +1206,7 @@ webSocketServer.on("connection", (webSocket) => {
                         forwardServerFrame(chunk);
                         return;
                     }
-                    replaceServerFrameBuffer(serverFrameBuffer.byteLength === 0
-                        ? chunk
-                        : Buffer.concat([serverFrameBuffer, chunk]));
+                    appendServerFrameBuffer(chunk);
                     drainServerFrameBuffer();
                 });
                 tcpSocket.once("error", (error) => {
@@ -1313,26 +1332,27 @@ webSocketServer.on("connection", (webSocket) => {
                     }
                 }
                 if (packetFramingEnabled && frameClientData !== undefined) {
-                    // The legacy path used Buffer.concat([clientFrameBuffer, clientData]);
-                    // handshake probing now supplies only the post-handshake
+                    // Handshake probing supplies only the post-handshake
                     // remainder so the raw handshake is never inspected twice.
-                    clientFrameBuffer = clientFrameBuffer.byteLength === 0
-                        ? frameClientData
-                        : Buffer.concat([clientFrameBuffer, frameClientData]);
+                    // Appending keeps each WebSocket chunk owned by the deque.
+                    appendClientFrameBuffer(frameClientData);
                     while (clientFrameBuffer.byteLength > 0) {
-                        const parsed = readMinecraftFrame(clientFrameBuffer);
+                        const parsed = clientFrameBuffer.peekFrame();
                         if (parsed === undefined) {
                             break;
                         }
                         if (parsed === null) {
                             packetFramingEnabled = false;
                             minecraftProfile = undefined;
-                            clientFrameBuffer = Buffer.alloc(0);
+                            clientFrameBuffer.clear();
                             clearClientStallTimer();
                             traceTunnelEvent("disabled keepalive proxy for opaque client traffic");
                             break;
                         }
-                        clientFrameBuffer = parsed.remainder;
+                        // Commit parser ownership before publishing any state
+                        // transition or packet observation.
+                        clientFrameBuffer.consume(parsed.frameBytes);
+                        observeClientFrameCoalescing(parsed);
                         if (protocolPhase === "login" &&
                             isPayloadlessPacket(
                                 parsed.frame,
@@ -1408,7 +1428,7 @@ webSocketServer.on("connection", (webSocket) => {
                     packetFramingEnabled = false;
                     minecraftProfile = undefined;
                     encryptionResponsePending = false;
-                    clientFrameBuffer = Buffer.alloc(0);
+                    clientFrameBuffer.clear();
                     clearClientStallTimer();
                     traceTunnelEvent("disabled keepalive proxy after login encryption response");
                     // Keep any complete/partial server bytes retained by a
