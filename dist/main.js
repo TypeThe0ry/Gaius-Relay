@@ -210,12 +210,14 @@ function proxyVanillaKeepAlive(socket, frame, protocolPhase, profile) {
     const response = Buffer.from(frame);
     response[2] = responsePacketId;
     socket.write(response);
-    traceTunnelEvent(
-        `proxied ${packetId === profile.configuration.clientboundKeepAlive
-            ? "configuration"
-            : "play"} keepalive `
-            + `head=${response.toString("hex")}`
-    );
+    if (traceTunnel) {
+        traceTunnelEvent(
+            `proxied ${packetId === profile.configuration.clientboundKeepAlive
+                ? "configuration"
+                : "play"} keepalive `
+                + `head=${response.toString("hex")}`
+        );
+    }
     return true;
 }
 
@@ -588,10 +590,14 @@ webSocketServer.on("connection", (webSocket) => {
                     remotePort: tcpSocket.remotePort ?? null,
                 }));
                 tcpSocket.on("data", (chunk) => {
-                    traceTunnelEvent(
-                        `server data ${request.host}:${request.port} bytes=${chunk.byteLength} `
-                            + `head=${chunk.subarray(0, 24).toString("hex")}`
-                    );
+                    // Hex previews are diagnostic-only. Building them on every PLAY chunk
+                    // needlessly taxes the RelayNode even when tunnel tracing is disabled.
+                    if (traceTunnel) {
+                        traceTunnelEvent(
+                            `server data ${request.host}:${request.port} bytes=${chunk.byteLength} `
+                                + `head=${chunk.subarray(0, 24).toString("hex")}`
+                        );
+                    }
                     lastActivity = Date.now();
                     if (!packetFramingEnabled) {
                         if (proxyVanillaKeepAlive(tcpSocket, chunk, protocolPhase, minecraftProfile)) {
@@ -618,7 +624,7 @@ webSocketServer.on("connection", (webSocket) => {
                             return;
                         }
                         serverFrameBuffer = parsed.remainder;
-                        if (protocolPhase === "play") {
+                        if (traceTunnel && protocolPhase === "play") {
                             const packet = minecraftPacketId(parsed.frame, parsed.headerBytes);
                             if (packet !== undefined) {
                                 lastServerPlayPacket = `0x${packet.id.toString(16)}/${parsed.frame.byteLength}`;
@@ -658,14 +664,16 @@ webSocketServer.on("connection", (webSocket) => {
                     closeBoth(1011, "TCP connection failed");
                 });
                 tcpSocket.once("close", (hadError) => {
-                    traceTunnelEvent(
-                        `TCP closed ${request.host}:${request.port} hadError=${Boolean(hadError)} `
-                            + `tunnelMs=${Date.now() - tunnelStartedAt} `
-                            + `playMs=${playStartedAt === undefined ? "n/a" : Date.now() - playStartedAt} `
-                            + `phase=${protocolPhase} configurationCycles=${configurationCycles} `
-                            + `lastServerPlay=${lastServerPlayPacket ?? "n/a"} `
-                            + `lastClientPlay=${lastClientPlayPacket ?? "n/a"}`
-                    );
+                    if (traceTunnel) {
+                        traceTunnelEvent(
+                            `TCP closed ${request.host}:${request.port} hadError=${Boolean(hadError)} `
+                                + `tunnelMs=${Date.now() - tunnelStartedAt} `
+                                + `playMs=${playStartedAt === undefined ? "n/a" : Date.now() - playStartedAt} `
+                                + `phase=${protocolPhase} configurationCycles=${configurationCycles} `
+                                + `lastServerPlay=${lastServerPlayPacket ?? "n/a"} `
+                                + `lastClientPlay=${lastClientPlayPacket ?? "n/a"}`
+                        );
+                    }
                     closeBoth(1000, "TCP connection closed");
                 });
             }, (error) => {
@@ -698,10 +706,12 @@ webSocketServer.on("connection", (webSocket) => {
                 }
                 const clientData = toBuffer(data);
                 lastClientTrafficAt = Date.now();
-                traceTunnelEvent(
-                    `client data ${request.host}:${request.port} bytes=${clientData.byteLength} `
-                        + `head=${clientData.subarray(0, 24).toString("hex")}`
-                );
+                if (traceTunnel) {
+                    traceTunnelEvent(
+                        `client data ${request.host}:${request.port} bytes=${clientData.byteLength} `
+                            + `head=${clientData.subarray(0, 24).toString("hex")}`
+                    );
+                }
                 if (!packetFramingEnabled && config.proxyKeepAlives && !minecraftHandshakeSeen) {
                     const handshake = parseMinecraftHandshake(clientData);
                     if (handshake !== undefined) {
@@ -784,7 +794,7 @@ webSocketServer.on("connection", (webSocket) => {
                             lastClientTrafficAt = Date.now();
                             traceTunnelEvent("client acknowledged PLAY to CONFIGURATION transition");
                         }
-                        if (protocolPhase === "play") {
+                        if (traceTunnel && protocolPhase === "play") {
                             const packet = minecraftPacketId(parsed.frame, parsed.headerBytes);
                             if (packet !== undefined) {
                                 lastClientPlayPacket = `0x${packet.id.toString(16)}/${parsed.frame.byteLength}`;
