@@ -167,6 +167,30 @@ only after a framed connection actually enters PLAY. MSYS `/c/...` paths are
 accepted for the profile, archive, and Java environment variables. Evidence and logs remain under
 `port/target/<profile>/browser-relay-full-path-evidence/`.
 
+Set `GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES=1` (default `0`, range `0--8`)
+to add a simultaneous multiplayer reconnect gate. After every client reaches
+PLAY and the chunk threshold, the harness abnormally terminates every WebSocket
+in one dispatch turn without asking the harness client to send a Minecraft
+disconnect packet. It verifies that each closed bridge entry retains its
+non-1000 close error and a deterministic synthetic marker delivered directly
+through the JSBody `onmessage` path immediately before termination. The marker
+checks inbound queue ordering and retention; it is not evidence of a real
+network tail frame. The harness then invokes the Java-like channel final-close
+hook and waits for active Browser and RelayNode state to drain to zero before reconnecting the same
+account identities on entirely new channel IDs. Each wave repeats online-mode
+session join/hasJoined, RSA/AES, configuration, PLAY, and chunk acceptance
+without reusing cipher objects or protocol buffers. Wave evidence includes
+drop-to-stage timings, RelayNode
+active/target-total connections and CPU/RSS deltas, browser queues/leases,
+WebSockets/channels, session counters, and final all-zero cleanup. A dual-profile
+cluster acceptance run normally uses 4 clients, 9 chunks, one reconnect wave,
+and a 15-second post-reconnect soak.
+The currently optional `retireClosedEntry` hook is reported as undefined and
+not invoked by this harness; the gate proves retained close evidence and final
+cleanup but does not claim to repair that product hook.
+Reconnect creation is driven manually by the harness after cleanup; this gate
+does not exercise or claim an automatic product retry policy.
+
 The harness evaluates the source `BrowserWebSocketChannel` JSBody with Node's
 `ws` implementation, so it proves real WebSocket framing, RelayNode TCP
 acceptance, online-mode RSA/AES, configuration, and PLAY/chunk traffic without
