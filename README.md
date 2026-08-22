@@ -121,30 +121,61 @@ an available node and establishes the first tunnel. See
 [`docs/relay-nodes.md`](../../docs/relay-nodes.md) for the contribution and
 security requirements.
 
-By default, the RelayNode replies to the exact unencrypted 1.21 keepalive frame
-while the browser is busy reloading a server resource pack. This prevents a
-backend read timeout during a long main-thread reload without inspecting or
-modifying ordinary game packets. It also emits the payloadless 1.21.11 client
-tick after configuration enters PLAY, then replays the client's exact tick
-frame while the browser is stalled. The relay tracks the reversible 1.21.11
-`PLAY -> CONFIGURATION -> PLAY` transition: it stops synthetic PLAY ticks as
-soon as the server sends Start Configuration, proxies configuration keepalives,
-and resumes only after the client finishes the new configuration cycle. Set
+By default, the RelayNode replies to exact unencrypted keepalive frames while
+the browser is busy reloading a server resource pack. It selects the packet
+table from the initial Minecraft handshake for 1.21.11 (774) or 26.2 (776),
+then emits the profile-specific payloadless client tick after configuration
+enters PLAY and replays the client's exact tick frame while the browser is
+stalled. The relay tracks the reversible `PLAY -> CONFIGURATION -> PLAY`
+transition: it stops synthetic PLAY ticks as soon as the server sends Start
+Configuration, proxies configuration keepalives, and resumes only after the
+client finishes the new configuration cycle. Unknown or malformed profiles
+remain opaque and never receive a guessed rewrite. Set
 `GAIUS_PROXY_KEEPALIVES=0` to disable this behavior.
 Encrypted online-mode traffic is opaque and remains fully transparent.
 
 Run the focused protocol test with:
 
 ```sh
-npm run smoke
+GAIUS_SMOKE_MINECRAFT_VERSION=1.21.11 npm run smoke
+GAIUS_SMOKE_MINECRAFT_VERSION=26.2 npm run smoke
+npm run smoke:profiles
 ```
+
+Run the standalone full browser-transport path against an unmodified local
+vanilla server and the local RelayNode with:
+
+```sh
+npm run smoke:browser-full-path
+GAIUS_VERSION_PROFILE_PATH=1.21.11 npm run smoke:browser-full-path
+```
+
+This check is intentionally not part of `npm run smoke` or ordinary CI: it
+starts Java and a real local RelayNode, and requires the profile-scoped vanilla
+archive at `port/target/<profile>/multiplayer-smoke-server/server-artifact.bin`. The archive
+must be a regular file whose SHA-1 matches the active profile; set
+`GAIUS_BROWSER_FULL_PATH_SERVER_archive` to an existing verified archive when using a
+different location. `GAIUS_BROWSER_FULL_PATH_CLIENTS` (1--4) and
+`GAIUS_BROWSER_FULL_PATH_SOAK_MS` tune the run. MSYS `/c/...` paths are accepted
+for the profile, archive, and Java environment variables. Evidence and logs remain
+under `port/target/<profile>/browser-relay-full-path-evidence/`.
+
+The harness evaluates the source `BrowserWebSocketChannel` JSBody with Node's
+`ws` implementation, so it proves real WebSocket framing, RelayNode TCP
+acceptance, online-mode RSA/AES, configuration, and PLAY/chunk traffic without
+requiring a TeaVM rebuild; the session API is a deterministic local fixture,
+not a call to Mojang. It is not a headed Chrome test: browser DOM,
+Chrome's WebSocket implementation, rendering/event-loop scheduling, and
+TeaVM-generated call boundaries remain outside this check.
 
 Verify the public node separately against a real Java server without making
 external network availability a CI requirement:
 
 ```sh
-npm run smoke:public
-GAIUS_PUBLIC_RELAY_TARGET=example.org:25565 npm run smoke:public
+GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION=1.21.11 npm run smoke:public
+GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION=26.2 npm run smoke:public
+GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION=26.2 \
+  GAIUS_PUBLIC_RELAY_TARGET=example.org:25565 npm run smoke:public
 ```
 
 The public smoke uses the first node in the root `relay-nodes.json` unless
@@ -156,16 +187,20 @@ range, the smoke resolves only the RelayNode hostname through DNS-over-HTTPS
 while preserving TLS hostname verification. `GAIUS_PUBLIC_RELAY_EDGE_IP` can
 be used as an explicit diagnostic override.
 
-The smoke test injects two interrupted 20 MiB resource-pack responses, requires
-the third response to reach the client with its original SHA-1, verifies a
-second cache hit without another upstream request, and ensures a browser abort
-does not start a retry. The
+The smoke test injects two cleanly truncated 20 MiB resource-pack responses
+whose `Content-Length` still declares the full body, requires the third
+response to reach the client with its original SHA-1, verifies a second cache
+hit without another upstream request, and ensures a browser abort does not
+start a retry. The
 local protocol fixture also forces a complete PLAY reconfiguration and rejects
 any PLAY tick injected before configuration finishes. Set
 `GAIUS_SMOKE_PLAY_SOAK_MS=60000` with `GAIUS_SMOKE_MINECRAFT_HOST` to keep a
 real server connection alive and validate any server-initiated reconfiguration.
-The
-optional public-server path also understands vanilla 1.21.11 server
+The protocol fixture defaults to Minecraft `1.21.11` (protocol `774`); set
+`GAIUS_SMOKE_MINECRAFT_VERSION=26.2` (or `776`) to exercise the 26.2 packet
+table. RelayNode selects the same table from each client's initial handshake,
+so one node can carry either supported version without a global setting.
+The optional public-server path also understands supported vanilla server
 dialogs and Code of Conduct confirmation before entering PLAY. Prompt handling
 is disabled unless the smoke process is explicitly started with
 `GAIUS_SMOKE_ACCEPT_SERVER_PROMPTS=1`. Text fields must also be supplied as a

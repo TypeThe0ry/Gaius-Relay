@@ -81,9 +81,15 @@ try {
         "RelayNode lease expired while registration heartbeats were active");
 
     const gracefulStopStartedAt = Date.now();
-    relay.child.kill("SIGTERM");
+    const gracefulViaStdin = process.platform === "win32";
+    if (gracefulViaStdin) {
+        relay.child.stdin.write("graceful-shutdown\n");
+    } else {
+        relay.child.kill("SIGTERM");
+    }
     const gracefulExitCode = await relay.exited;
-    assert(gracefulExitCode === 143, "RelayNode did not complete graceful SIGTERM shutdown");
+    assert(gracefulExitCode === (gracefulViaStdin ? 0 : 143),
+        "RelayNode did not complete graceful shutdown");
     relay = undefined;
     await waitFor(async () => {
         const value = await fetchJson(`${registryBase}/relay-nodes.json`);
@@ -206,7 +212,7 @@ function startNode(script, additions, removals = []) {
     const child = spawn(process.execPath, [script], {
         cwd: new URL(".", import.meta.url),
         env: environment,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe"],
     });
     const state = {
         child,

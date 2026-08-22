@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { WebSocket, WebSocketServer, } from "ws";
 import { loadConfig } from "./config.js";
 import { isHostAllowed, isOriginAllowed, isPrivateNetworkAddress, normalizeHost, parseConnectRequest, } from "./policy.js";
+import { resolveMinecraftProfile } from "./protocol.js";
 const config = loadConfig();
 const traceTunnel = process.env.GAIUS_TRACE_TUNNEL === "1";
 const dnsTestScenario = process.env.NODE_ENV === "test"
@@ -51,11 +52,11 @@ const relayCapabilities = [
     "public-target-guard",
     "target-attestation",
 ];
-// `ServerboundClientTickEndPacket` is emitted once per client tick in 1.21.11.
-// A resource/model reload can temporarily stop browser ticks, while a spawn
-// proxy can require the next tick before its short read timeout. The relay can
-// synthesize this payloadless 1.21.11 packet as soon as configuration enters
-// PLAY, then switches to the exact frame observed from the browser.
+// `ServerboundClientTickEndPacket` is emitted once per client tick. A resource
+// or model reload can temporarily stop browser ticks, while a spawn proxy can
+// require the next tick before its short read timeout. The relay can synthesize
+// the profile-specific payloadless packet as soon as configuration enters PLAY,
+// then switches to the exact frame observed from the browser.
 const stalledClientTickIntervalMs = 50;
 const stalledClientTickGraceMs = 100;
 
@@ -84,6 +85,25 @@ let shutdownStarted = false;
 process.once("exit", cleanupResourcePackTemporaryFiles);
 process.once("SIGINT", () => void shutdownRelayNode(130));
 process.once("SIGTERM", () => void shutdownRelayNode(143));
+// Windows cannot deliver SIGTERM across process boundaries (child.kill("SIGTERM")
+// hard-terminates without running this process' handlers). Accept a
+// "graceful-shutdown" line on stdin as a cross-platform equivalent so
+// orchestration and smoke tests can still exercise the graceful unregister path.
+process.stdin.setEncoding("utf8");
+let stdinBuffer = "";
+process.stdin.on("data", (chunk) => {
+    stdinBuffer += chunk;
+    let newline;
+    while ((newline = stdinBuffer.indexOf("\n")) !== -1) {
+        const line = stdinBuffer.slice(0, newline).trim();
+        stdinBuffer = stdinBuffer.slice(newline + 1);
+        if (line === "graceful-shutdown") {
+            void shutdownRelayNode(0);
+            return;
+        }
+    }
+});
+process.stdin.resume();
 
 function targetRouteKey(host, port) {
     const normalized = normalizeHost(host);
@@ -164,23 +184,25 @@ function targetRouteSnapshot(request) {
 
 // A zero-compression keepalive is a complete 11-byte Minecraft frame. During a
 // large browser resource reload, acknowledging it in the translator node prevents a
-// backend read timeout without delaying arbitrary game packets. These ids are
-// from the 1.21.11 configuration and play protocol tables respectively.
-function proxyVanillaKeepAlive(socket, frame, protocolPhase) {
-    if (!config.proxyKeepAlives || frame.byteLength !== 11 ||
+// backend read timeout without delaying arbitrary game packets. The packet ids
+// come from the profile selected by the client's handshake.
+function proxyVanillaKeepAlive(socket, frame, protocolPhase, profile) {
+    if (!config.proxyKeepAlives || profile === undefined || frame.byteLength !== 11 ||
         frame[0] !== 0x0a || frame[1] !== 0x00) {
         return false;
     }
     const packetId = frame[2];
     let responsePacketId;
-    if ((protocolPhase === "login" || protocolPhase === "configuration") &&
-        packetId === 0x04) {
+    if ((protocolPhase === "login" || protocolPhase === "configuration" ||
+        protocolPhase === "reconfiguring") &&
+        packetId === profile.configuration.clientboundKeepAlive) {
         // Configuration uses the common keepalive packet id in both directions.
-        responsePacketId = 0x04;
+        responsePacketId = profile.configuration.serverboundKeepAlive;
     }
-    else if (protocolPhase === "play" && packetId === 0x2b) {
+    else if (protocolPhase === "play" &&
+        packetId === profile.play.clientboundKeepAlive) {
         // PLAY has different clientbound/serverbound packet registries.
-        responsePacketId = 0x1b;
+        responsePacketId = profile.play.serverboundKeepAlive;
     }
     else {
         return false;
@@ -189,7 +211,9 @@ function proxyVanillaKeepAlive(socket, frame, protocolPhase) {
     response[2] = responsePacketId;
     socket.write(response);
     traceTunnelEvent(
-        `proxied ${packetId === 0x04 ? "configuration" : "play"} keepalive `
+        `proxied ${packetId === profile.configuration.clientboundKeepAlive
+            ? "configuration"
+            : "play"} keepalive `
             + `head=${response.toString("hex")}`
     );
     return true;
@@ -230,15 +254,83 @@ function isLoginEncryptionRequest(frame, headerBytes) {
     return frame.byteLength > headerBytes && frame[headerBytes] === 0x01;
 }
 
-function isMinecraftHandshake(frame) {
+function decodeMinecraftVarInt(bytes, offset = 0) {
+    let value = 0;
+    for (let index = 0; index < 5; index++) {
+        if (offset + index >= bytes.byteLength) {
+            return undefined;
+        }
+        const current = bytes[offset + index];
+        value |= (current & 0x7f) << (index * 7);
+        if ((current & 0x80) === 0) {
+            return { value: value >>> 0, bytesRead: index + 1 };
+        }
+    }
+    return null;
+}
+
+function encodeMinecraftVarInt(value) {
+    if (!Number.isSafeInteger(value) || value < 0 || value > 0x7fffffff) {
+        throw new RangeError(`Minecraft packet id must be a non-negative 31-bit integer, got ${value}`);
+    }
+    const bytes = [];
+    do {
+        let current = value & 0x7f;
+        value >>>= 7;
+        if (value !== 0) {
+            current |= 0x80;
+        }
+        bytes.push(current);
+    } while (value !== 0);
+    return Buffer.from(bytes);
+}
+
+function createPayloadlessMinecraftFrame(packetId, compressed) {
+    const packet = encodeMinecraftVarInt(packetId);
+    const body = compressed
+        ? Buffer.concat([encodeMinecraftVarInt(0), packet])
+        : packet;
+    return Buffer.concat([encodeMinecraftVarInt(body.byteLength), body]);
+}
+
+function parseMinecraftHandshake(frame) {
     const parsed = readMinecraftFrame(frame);
-    if (parsed === undefined || parsed === null || parsed.remainder.byteLength !== 0) {
-        return false;
+    if (parsed === undefined || parsed === null) {
+        return undefined;
     }
     const packetOffset = parsed.headerBytes;
-    const nextState = parsed.frame[parsed.frame.byteLength - 1];
-    return parsed.frame.byteLength > packetOffset + 2 &&
-        parsed.frame[packetOffset] === 0x00 && (nextState === 0x01 || nextState === 0x02);
+    const packetId = decodeMinecraftVarInt(parsed.frame, packetOffset);
+    if (packetId === undefined || packetId === null || packetId.value !== 0) {
+        return undefined;
+    }
+    let offset = packetOffset + packetId.bytesRead;
+    const protocolVersion = decodeMinecraftVarInt(parsed.frame, offset);
+    if (protocolVersion === undefined || protocolVersion === null) {
+        return undefined;
+    }
+    offset += protocolVersion.bytesRead;
+    const hostLength = decodeMinecraftVarInt(parsed.frame, offset);
+    if (hostLength === undefined || hostLength === null ||
+        hostLength.value > 255) {
+        return undefined;
+    }
+    offset += hostLength.bytesRead;
+    const hostEnd = offset + hostLength.value;
+    if (hostEnd + 2 > parsed.frame.byteLength) {
+        return undefined;
+    }
+    offset = hostEnd + 2;
+    const nextState = decodeMinecraftVarInt(parsed.frame, offset);
+    if (nextState === undefined || nextState === null ||
+        (nextState.value !== 1 && nextState.value !== 2) ||
+        offset + nextState.bytesRead !== parsed.frame.byteLength) {
+        return undefined;
+    }
+    return {
+        protocolVersion: protocolVersion.value,
+        profile: resolveMinecraftProfile(protocolVersion.value),
+        remainder: parsed.remainder,
+    };
 }
 
 function minecraftPacketId(frame, headerBytes) {
@@ -259,7 +351,7 @@ function isPayloadlessPacket(frame, headerBytes, packetId) {
         packet.packetOffset + 1 === frame.byteLength;
 }
 
-function traceCustomPayload(frame, headerBytes, direction, playPhase) {
+function traceCustomPayload(frame, headerBytes, direction, playPhase, profile) {
     if (!traceTunnel || !playPhase || frame.byteLength <= headerBytes + 2) {
         return;
     }
@@ -268,7 +360,9 @@ function traceCustomPayload(frame, headerBytes, direction, playPhase) {
     // small, plaintext form; encrypted/compressed traffic stays opaque.
     const packetOffset = frame[headerBytes] === 0x00 ? headerBytes + 1 : headerBytes;
     const packetId = frame[packetOffset];
-    const expectedPacketId = direction === "server" ? 0x18 : 0x15;
+    const expectedPacketId = direction === "server"
+        ? profile.play.clientboundCustomPayload
+        : profile.play.serverboundCustomPayload;
     if (packetId !== expectedPacketId || frame.byteLength <= packetOffset + 1) {
         return;
     }
@@ -353,6 +447,11 @@ webSocketServer.on("connection", (webSocket) => {
     let configurationCycles = 0;
     let serverFrameBuffer = Buffer.alloc(0);
     let clientFrameBuffer = Buffer.alloc(0);
+    // The first Minecraft handshake selects the packet-id table. Do not assume
+    // the legacy table before that handshake: an unknown or malformed profile
+    // must stay an opaque raw TCP tunnel rather than receive a guessed rewrite.
+    let minecraftProfile;
+    let minecraftHandshakeSeen = false;
     const tunnelStartedAt = Date.now();
     let playStartedAt;
     let lastServerPlayPacket;
@@ -495,7 +594,7 @@ webSocketServer.on("connection", (webSocket) => {
                     );
                     lastActivity = Date.now();
                     if (!packetFramingEnabled) {
-                        if (proxyVanillaKeepAlive(tcpSocket, chunk, protocolPhase)) {
+                        if (proxyVanillaKeepAlive(tcpSocket, chunk, protocolPhase, minecraftProfile)) {
                             return;
                         }
                         forwardServerFrame(chunk);
@@ -512,6 +611,7 @@ webSocketServer.on("connection", (webSocket) => {
                         if (parsed === null) {
                             // This is normally encrypted online-mode traffic.
                             packetFramingEnabled = false;
+                            minecraftProfile = undefined;
                             traceTunnelEvent("disabled keepalive proxy for opaque server traffic");
                             forwardServerFrame(serverFrameBuffer);
                             serverFrameBuffer = Buffer.alloc(0);
@@ -525,7 +625,11 @@ webSocketServer.on("connection", (webSocket) => {
                             }
                         }
                         if (protocolPhase === "play" &&
-                            isPayloadlessPacket(parsed.frame, parsed.headerBytes, 0x74)) {
+                            isPayloadlessPacket(
+                                parsed.frame,
+                                parsed.headerBytes,
+                                minecraftProfile.play.clientboundStartConfiguration
+                            )) {
                             protocolPhase = "reconfiguring";
                             traceTunnelEvent("server started PLAY to CONFIGURATION transition");
                         }
@@ -536,9 +640,15 @@ webSocketServer.on("connection", (webSocket) => {
                             parsed.frame,
                             parsed.headerBytes,
                             "server",
-                            protocolPhase === "play"
+                            protocolPhase === "play",
+                            minecraftProfile
                         );
-                        if (!proxyVanillaKeepAlive(tcpSocket, parsed.frame, protocolPhase)) {
+                        if (!proxyVanillaKeepAlive(
+                            tcpSocket,
+                            parsed.frame,
+                            protocolPhase,
+                            minecraftProfile
+                        )) {
                             forwardServerFrame(parsed.frame);
                         }
                     }
@@ -592,10 +702,25 @@ webSocketServer.on("connection", (webSocket) => {
                     `client data ${request.host}:${request.port} bytes=${clientData.byteLength} `
                         + `head=${clientData.subarray(0, 24).toString("hex")}`
                 );
-                if (!packetFramingEnabled && config.proxyKeepAlives &&
-                    isMinecraftHandshake(clientData)) {
-                    packetFramingEnabled = true;
-                    traceTunnelEvent("enabled framed keepalive proxy after Minecraft handshake");
+                if (!packetFramingEnabled && config.proxyKeepAlives && !minecraftHandshakeSeen) {
+                    const handshake = parseMinecraftHandshake(clientData);
+                    if (handshake !== undefined) {
+                        minecraftHandshakeSeen = true;
+                    }
+                    if (handshake?.profile === undefined && handshake !== undefined) {
+                        minecraftProfile = undefined;
+                        traceTunnelEvent(
+                            `disabled profile-aware rewrites for unsupported Minecraft protocol `
+                                + `${handshake.protocolVersion}`
+                        );
+                    }
+                    else if (handshake?.profile !== undefined) {
+                        minecraftProfile = handshake.profile;
+                        packetFramingEnabled = true;
+                        traceTunnelEvent(
+                            `enabled framed keepalive proxy for Minecraft ${minecraftProfile.name}`
+                        );
+                    }
                 }
                 if (packetFramingEnabled) {
                     clientFrameBuffer = clientFrameBuffer.byteLength === 0
@@ -608,25 +733,35 @@ webSocketServer.on("connection", (webSocket) => {
                         }
                         if (parsed === null) {
                             packetFramingEnabled = false;
+                            minecraftProfile = undefined;
                             clientFrameBuffer = Buffer.alloc(0);
                             traceTunnelEvent("disabled keepalive proxy for opaque client traffic");
                             break;
                         }
                         clientFrameBuffer = parsed.remainder;
                         if (protocolPhase === "login" &&
-                            isPayloadlessPacket(parsed.frame, parsed.headerBytes, 0x03)) {
+                            isPayloadlessPacket(
+                                parsed.frame,
+                                parsed.headerBytes,
+                                minecraftProfile.login.serverboundLoginAcknowledged
+                            )) {
                             protocolPhase = "configuration";
                             traceTunnelEvent("login acknowledged; entered CONFIGURATION");
                         }
                         else if (protocolPhase === "configuration" &&
-                            isPayloadlessPacket(parsed.frame, parsed.headerBytes, 0x03)) {
+                            isPayloadlessPacket(
+                                parsed.frame,
+                                parsed.headerBytes,
+                                minecraftProfile.configuration.serverboundFinish
+                            )) {
                             configurationCycles++;
                             protocolPhase = "play";
-                            // 1.21.11 ServerboundClientTickEndPacket is 0x0c. Match the
-                            // compression framing already used by the configuration ACK.
-                            playTickFrame = parsed.frame[parsed.headerBytes] === 0x00
-                                ? Buffer.from([0x02, 0x00, 0x0c])
-                                : Buffer.from([0x01, 0x0c]);
+                            // Match the compression framing already used by the
+                            // configuration ACK while selecting the profile's tick id.
+                            playTickFrame = createPayloadlessMinecraftFrame(
+                                minecraftProfile.play.serverboundClientTickEnd,
+                                parsed.frame[parsed.headerBytes] === 0x00
+                            );
                             lastClientTrafficAt = Date.now();
                             if (playStartedAt === undefined) {
                                 playStartedAt = Date.now();
@@ -640,7 +775,11 @@ webSocketServer.on("connection", (webSocket) => {
                         }
                         else if ((protocolPhase === "play" ||
                             protocolPhase === "reconfiguring") &&
-                            isPayloadlessPacket(parsed.frame, parsed.headerBytes, 0x0f)) {
+                            isPayloadlessPacket(
+                                parsed.frame,
+                                parsed.headerBytes,
+                                minecraftProfile.play.serverboundConfigurationAcknowledged
+                            )) {
                             protocolPhase = "configuration";
                             lastClientTrafficAt = Date.now();
                             traceTunnelEvent("client acknowledged PLAY to CONFIGURATION transition");
@@ -652,7 +791,11 @@ webSocketServer.on("connection", (webSocket) => {
                             }
                         }
                         if (protocolPhase === "play" &&
-                            isPayloadlessPacket(parsed.frame, parsed.headerBytes, 0x0c)) {
+                            isPayloadlessPacket(
+                                parsed.frame,
+                                parsed.headerBytes,
+                                minecraftProfile.play.serverboundClientTickEnd
+                            )) {
                             playTickFrame = Buffer.from(parsed.frame);
                             traceTunnelEvent("observed play tick for stall proxy");
                         }
@@ -660,12 +803,14 @@ webSocketServer.on("connection", (webSocket) => {
                             parsed.frame,
                             parsed.headerBytes,
                             "client",
-                            protocolPhase === "play"
+                            protocolPhase === "play",
+                            minecraftProfile
                         );
                     }
                 }
                 if (encryptionResponsePending) {
                     packetFramingEnabled = false;
+                    minecraftProfile = undefined;
                     encryptionResponsePending = false;
                     serverFrameBuffer = Buffer.alloc(0);
                     clientFrameBuffer = Buffer.alloc(0);
@@ -1743,7 +1888,8 @@ async function downloadResourcePackWithRetries(target, init, maximumBytes) {
         try {
             throwIfProxyClientDisconnected(init.signal);
             upstream = await fetchWithValidatedRedirects(target, init, "resource-pack");
-            temporary = await spoolResponseBody(upstream.body, maximumBytes);
+            const declaredLength = parseResponseContentLength(upstream.headers);
+            temporary = await spoolResponseBody(upstream.body, maximumBytes, declaredLength);
             throwIfProxyClientDisconnected(init.signal);
             traceTunnelEvent(
                 `resource-pack body ready bytes=${temporary.byteLength} attempt=${attempt + 1}`);
@@ -1768,8 +1914,22 @@ async function downloadResourcePackWithRetries(target, init, maximumBytes) {
     }
     throw lastError ?? new Error("Resource-pack body download exhausted all retries");
 }
-async function spoolResponseBody(body, maximumBytes) {
+function parseResponseContentLength(headers) {
+    const raw = headers.get("content-length");
+    if (raw === null || raw.trim() === "") {
+        return undefined;
+    }
+    const parsed = Number(raw);
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+async function spoolResponseBody(body, maximumBytes, declaredLength) {
+    if (declaredLength !== undefined && declaredLength > maximumBytes) {
+        throw new ProxyResponseSizeError();
+    }
     if (body === null) {
+        if (declaredLength !== undefined && declaredLength !== 0) {
+            throw new ProxyResponseTruncatedError(declaredLength, 0);
+        }
         return { path: undefined, byteLength: 0 };
     }
     const path = join(
@@ -1795,6 +1955,9 @@ async function spoolResponseBody(body, maximumBytes) {
                 }
                 offset += result.bytesWritten;
             }
+        }
+        if (declaredLength !== undefined && byteLength !== declaredLength) {
+            throw new ProxyResponseTruncatedError(declaredLength, byteLength);
         }
         await file.close();
         return { path, byteLength };
@@ -1946,5 +2109,13 @@ class ProxyResponseSizeError extends Error {
     constructor() {
         super("Proxy response exceeded size limit");
         this.name = "ProxyResponseSizeError";
+    }
+}
+class ProxyResponseTruncatedError extends Error {
+    constructor(expectedLength, receivedLength) {
+        super(`Resource-pack body length mismatch: expected ${expectedLength} bytes, received ${receivedLength}`);
+        this.name = "ProxyResponseTruncatedError";
+        this.expectedLength = expectedLength;
+        this.receivedLength = receivedLength;
     }
 }

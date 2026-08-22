@@ -11,7 +11,9 @@
     "start": "node dist/main.js",
     "start:registry": "node dist/registry.js",
     "smoke": "node multiplayer-smoke.mjs && node registry-smoke.mjs && node local-relay/scripts/browser-relay-routing-smoke.mjs",
-    "smoke:public": "node public-relay-smoke.mjs"
+    "smoke:profiles": "node profile-protocol-smoke.mjs",
+    "smoke:public": "node public-relay-smoke.mjs",
+    "smoke:browser-full-path": "node browser-full-path-smoke.mjs"
   },
   "dependencies": {
     "ws": "8.21.0"
