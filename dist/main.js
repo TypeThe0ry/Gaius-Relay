@@ -82,6 +82,41 @@ let syntheticPlayTickBackpressureEvents = 0;
 let syntheticPlayTickMaxWritableLength = 0;
 let pendingSyntheticPlayTicks = 0;
 let maxPendingSyntheticPlayTicks = 0;
+let activeServerFrameDrainHandles = 0;
+// Server -> WebSocket framing telemetry is aggregate process state. The
+// enqueued/error/cleanup counters survive tunnel cleanup so the manifest
+// remains useful for a bounded smoke/operations window. Gauge fields are
+// updated exactly; an underflow is counted rather than silently clamped.
+const serverFrameTelemetry = {
+    enqueuedFrames: 0,
+    enqueuedBytes: 0,
+    sendErrors: 0,
+    cleanupBytes: 0,
+    bufferedUnderflows: 0,
+    bufferedUnderflowBytes: 0,
+    drainHandleUnderflows: 0,
+    dataCallbacks: 0,
+    scheduledDrains: 0,
+    drainCompletions: 0,
+    dataCallbacksAtPause: 0,
+    dataCallbacksAtDrainStart: 0,
+    dataCallbacksAtDrainCompletion: 0,
+    retainedCompleteFrames: 0,
+    maxRetainedCompleteFrames: 0,
+    pauses: 0,
+    resumes: 0,
+    framesAfterPause: 0,
+    maxBufferedAmount: 0,
+    bufferedFrameBytes: 0,
+    maxBufferedFrameBytes: 0,
+};
+const serverFrameForwardResult = Object.freeze({
+    ENQUEUED: "enqueued",
+    ENQUEUED_PAUSED: "enqueued-paused",
+    PAUSED: "paused",
+    CLOSED: "closed",
+    ERROR: "error",
+});
 const relayRegistrationState = {
     configured: config.registration !== undefined,
     registered: false,
@@ -428,6 +463,40 @@ function relayRuntimeSnapshot() {
         syntheticPlayTickMaxWritableLength,
         pendingSyntheticPlayTicks,
         maxPendingSyntheticPlayTicks,
+        activeServerFrameDrainHandles,
+        activeServerFrameDrainTimers: activeServerFrameDrainHandles,
+        serverFrameBackpressure: {
+            ...serverFrameTelemetry,
+            // Compatibility aliases for the first P0 telemetry shape.
+            sendFrames: serverFrameTelemetry.enqueuedFrames,
+            sendBytes: serverFrameTelemetry.enqueuedBytes,
+        },
+        // Keep the scalar names easy to consume from existing health probes;
+        // their established "sent" spelling means successfully enqueued.
+        serverFramesSent: serverFrameTelemetry.enqueuedFrames,
+        serverFrameBytesSent: serverFrameTelemetry.enqueuedBytes,
+        serverFrameEnqueuedFrames: serverFrameTelemetry.enqueuedFrames,
+        serverFrameEnqueuedBytes: serverFrameTelemetry.enqueuedBytes,
+        serverFrameSendErrors: serverFrameTelemetry.sendErrors,
+        serverFrameCleanupBytes: serverFrameTelemetry.cleanupBytes,
+        serverFrameBufferedUnderflows: serverFrameTelemetry.bufferedUnderflows,
+        serverFrameBufferedUnderflowBytes: serverFrameTelemetry.bufferedUnderflowBytes,
+        activeServerFrameDrainHandleUnderflows: serverFrameTelemetry.drainHandleUnderflows,
+        serverFrameDataCallbacks: serverFrameTelemetry.dataCallbacks,
+        serverFrameScheduledDrains: serverFrameTelemetry.scheduledDrains,
+        serverFrameDrainCompletions: serverFrameTelemetry.drainCompletions,
+        serverFrameDataCallbacksAtPause: serverFrameTelemetry.dataCallbacksAtPause,
+        serverFrameDataCallbacksAtDrainStart: serverFrameTelemetry.dataCallbacksAtDrainStart,
+        serverFrameDataCallbacksAtDrainCompletion:
+            serverFrameTelemetry.dataCallbacksAtDrainCompletion,
+        serverFrameBufferedCompleteFrames: serverFrameTelemetry.retainedCompleteFrames,
+        serverFrameMaxBufferedCompleteFrames: serverFrameTelemetry.maxRetainedCompleteFrames,
+        serverFramePauses: serverFrameTelemetry.pauses,
+        serverFrameResumes: serverFrameTelemetry.resumes,
+        serverFramesAfterPause: serverFrameTelemetry.framesAfterPause,
+        serverFrameMaxBufferedAmount: serverFrameTelemetry.maxBufferedAmount,
+        serverFrameBufferedBytes: serverFrameTelemetry.bufferedFrameBytes,
+        serverFrameMaxBufferedBytes: serverFrameTelemetry.maxBufferedFrameBytes,
         rssBytes: memory.rss,
         heapUsedBytes: memory.heapUsed,
         externalBytes: memory.external,
@@ -495,9 +564,19 @@ webSocketServer.on("connection", (webSocket) => {
     let connected = false;
     let tcpPausedForWebSocket = false;
     let tcpPausedForClient = false;
+    // A low-water callback must not resume the TCP source until the retained
+    // parser remainder has had its own guarded drain turn. This separate hold
+    // keeps TCP paused while tcpPausedForWebSocket is cleared for the drain.
+    let serverFrameDrainHoldingRead = false;
     let protocolPhase = "login";
     let configurationCycles = 0;
     let serverFrameBuffer = Buffer.alloc(0);
+    let serverFrameRetainedCompleteFrames = 0;
+    let serverFrameInFlightFrameBytes = 0;
+    let serverFrameDrainHandle;
+    let serverFrameDrainScheduled = false;
+    let serverFrameDrainRunning = false;
+    let serverFrameDrainRescheduleRequested = false;
     let clientFrameBuffer = Buffer.alloc(0);
     let minecraftHandshakeBuffer = Buffer.alloc(0);
     // The first Minecraft handshake selects the packet-id table. Do not assume
@@ -637,6 +716,7 @@ webSocketServer.on("connection", (webSocket) => {
         clearInterval(idleTimer);
         clearClientStallTimer();
         tunnelCancelled = true;
+        clearServerFrameState();
         tunnelConnectAbortController.abort();
         releaseTargetRoute();
         tcpSocket?.destroy();
@@ -649,39 +729,226 @@ webSocketServer.on("connection", (webSocket) => {
         if (!connected || tcpSocket === undefined) {
             return;
         }
-        if (tcpPausedForWebSocket || tcpPausedForClient) {
+        if (tcpPausedForWebSocket || tcpPausedForClient || serverFrameDrainHoldingRead) {
             tcpSocket.pause();
         }
         else {
             tcpSocket.resume();
         }
     };
-    const forwardServerFrame = (frame) => {
-        if (webSocket.readyState !== WebSocket.OPEN) {
+    const countCompleteServerFrames = () => {
+        if (!packetFramingEnabled) {
+            return 0;
+        }
+        let remaining = serverFrameBuffer;
+        let count = 0;
+        let inFlightBytes = serverFrameInFlightFrameBytes;
+        while (remaining.byteLength > 0) {
+            const parsed = readMinecraftFrame(remaining);
+            if (parsed === undefined || parsed === null) {
+                break;
+            }
+            if (inFlightBytes > 0) {
+                inFlightBytes -= parsed.frame.byteLength;
+                remaining = parsed.remainder;
+                continue;
+            }
+            count++;
+            remaining = parsed.remainder;
+        }
+        return count;
+    };
+    const updateRetainedCompleteFrameTelemetry = (next = countCompleteServerFrames()) => {
+        const nextCount = Number.isInteger(next) && next >= 0 ? next : 0;
+        const aggregate = serverFrameTelemetry.retainedCompleteFrames +
+            nextCount - serverFrameRetainedCompleteFrames;
+        if (aggregate < 0) {
+            serverFrameTelemetry.bufferedUnderflows++;
+            serverFrameTelemetry.bufferedUnderflowBytes += -aggregate;
+            serverFrameTelemetry.retainedCompleteFrames = 0;
+        }
+        else {
+            serverFrameTelemetry.retainedCompleteFrames = aggregate;
+        }
+        serverFrameRetainedCompleteFrames = nextCount;
+        serverFrameTelemetry.maxRetainedCompleteFrames = Math.max(
+            serverFrameTelemetry.maxRetainedCompleteFrames,
+            serverFrameTelemetry.retainedCompleteFrames,
+        );
+    };
+    const replaceServerFrameBuffer = (next) => {
+        const nextBuffer = next.byteLength === 0 ? Buffer.alloc(0) : next;
+        const aggregate = serverFrameTelemetry.bufferedFrameBytes +
+            nextBuffer.byteLength - serverFrameBuffer.byteLength;
+        if (aggregate < 0) {
+            // A close callback can race a final drain callback. Keep the gauge
+            // usable, but expose the invariant violation instead of hiding it.
+            serverFrameTelemetry.bufferedUnderflows++;
+            serverFrameTelemetry.bufferedUnderflowBytes += -aggregate;
+            serverFrameTelemetry.bufferedFrameBytes = 0;
+        }
+        else {
+            serverFrameTelemetry.bufferedFrameBytes = aggregate;
+        }
+        serverFrameBuffer = nextBuffer;
+        serverFrameTelemetry.maxBufferedFrameBytes = Math.max(
+            serverFrameTelemetry.maxBufferedFrameBytes,
+            serverFrameTelemetry.bufferedFrameBytes,
+        );
+    };
+    const observeWebSocketBufferedAmount = () => {
+        const bufferedAmount = Number(webSocket.bufferedAmount);
+        if (Number.isFinite(bufferedAmount) && bufferedAmount >= 0) {
+            serverFrameTelemetry.maxBufferedAmount = Math.max(
+                serverFrameTelemetry.maxBufferedAmount,
+                bufferedAmount,
+            );
+            return bufferedAmount;
+        }
+        return 0;
+    };
+    const pauseTcpForWebSocket = () => {
+        if (tcpPausedForWebSocket) {
             return;
         }
-        webSocket.send(frame, { binary: true }, (error) => {
-            if (error) {
-                const target = tunnelRequest === undefined
-                    ? "unknown target"
-                    : `${tunnelRequest.host}:${tunnelRequest.port}`;
-                console.error(`WebSocket send error for ${target}:`, error.message);
-            }
-            if (error && webSocket.readyState === WebSocket.OPEN) {
-                closeBoth(1011, "WebSocket send failed");
-                return;
-            }
-            if (tcpPausedForWebSocket &&
-                webSocket.bufferedAmount < maximumWebSocketBufferedBytes) {
-                tcpPausedForWebSocket = false;
-                updateTcpReadState();
-            }
+        tcpPausedForWebSocket = true;
+        serverFrameTelemetry.pauses++;
+        serverFrameTelemetry.dataCallbacksAtPause = serverFrameTelemetry.dataCallbacks;
+        updateRetainedCompleteFrameTelemetry();
+        updateTcpReadState();
+    };
+    let drainServerFrameBuffer;
+    const releaseServerFrameDrainHandle = () => {
+        if (activeServerFrameDrainHandles <= 0) {
+            serverFrameTelemetry.drainHandleUnderflows++;
+            activeServerFrameDrainHandles = 0;
+            return;
+        }
+        activeServerFrameDrainHandles--;
+    };
+    const scheduleServerFrameDrain = () => {
+        if (serverFrameDrainRunning) {
+            // A synchronous/fake WebSocket callback can clear the pause while
+            // the parser is still on the stack. Remember exactly one retry for
+            // the finally block instead of re-entering the parser.
+            serverFrameDrainRescheduleRequested = true;
+            return;
+        }
+        if (serverFrameDrainScheduled || tunnelCancelled || !connected || tcpSocket === undefined ||
+            tcpSocket.destroyed || webSocket.readyState !== WebSocket.OPEN ||
+            tcpPausedForWebSocket || tcpPausedForClient || serverFrameBuffer.byteLength === 0) {
+            return;
+        }
+        serverFrameDrainScheduled = true;
+        activeServerFrameDrainHandles++;
+        serverFrameDrainHandle = setImmediate(() => {
+            serverFrameDrainHandle = undefined;
+            serverFrameDrainScheduled = false;
+            releaseServerFrameDrainHandle();
+            serverFrameTelemetry.scheduledDrains++;
+            serverFrameTelemetry.dataCallbacksAtDrainStart =
+                serverFrameTelemetry.dataCallbacks;
+            drainServerFrameBuffer?.();
         });
-        if (!tcpPausedForWebSocket &&
-            webSocket.bufferedAmount >= maximumWebSocketBufferedBytes) {
-            tcpPausedForWebSocket = true;
+    };
+    const resumeServerFrameIfLowWater = () => {
+        if (!tcpPausedForWebSocket || tunnelCancelled ||
+            webSocket.readyState !== WebSocket.OPEN) {
+            return false;
+        }
+        const bufferedAmount = observeWebSocketBufferedAmount();
+        if (bufferedAmount >= maximumWebSocketBufferedBytes) {
+            return false;
+        }
+        // Clear only the WebSocket high-water flag. If a parser remainder is
+        // present, serverFrameDrainHoldingRead keeps the TCP source paused
+        // until the next-turn drain has actually consumed it.
+        tcpPausedForWebSocket = false;
+        serverFrameTelemetry.resumes++;
+        if (serverFrameBuffer.byteLength > 0) {
+            serverFrameDrainHoldingRead = true;
+            updateTcpReadState();
+            scheduleServerFrameDrain();
+        }
+        else {
+            serverFrameDrainHoldingRead = false;
             updateTcpReadState();
         }
+        return true;
+    };
+    const clearServerFrameState = () => {
+        if (serverFrameDrainHandle !== undefined) {
+            clearImmediate(serverFrameDrainHandle);
+            serverFrameDrainHandle = undefined;
+            releaseServerFrameDrainHandle();
+        }
+        serverFrameDrainScheduled = false;
+        serverFrameDrainRescheduleRequested = false;
+        if (serverFrameBuffer.byteLength > 0) {
+            serverFrameTelemetry.cleanupBytes += serverFrameBuffer.byteLength;
+        }
+        updateRetainedCompleteFrameTelemetry(0);
+        replaceServerFrameBuffer(Buffer.alloc(0));
+        tcpPausedForWebSocket = false;
+        serverFrameDrainHoldingRead = false;
+    };
+    const forwardServerFrame = (frame) => {
+        if (webSocket.readyState !== WebSocket.OPEN || tunnelCancelled) {
+            return serverFrameForwardResult.CLOSED;
+        }
+        if (tcpPausedForWebSocket) {
+            // This is an attempted parser send while paused. The parser should
+            // normally break before reaching here; retaining the counter makes
+            // regressions visible without allowing a duplicate frame to escape.
+            serverFrameTelemetry.framesAfterPause++;
+            return serverFrameForwardResult.PAUSED;
+        }
+        const frameBytes = frame.byteLength;
+        observeWebSocketBufferedAmount();
+        let sendCallbackError;
+        try {
+            webSocket.send(frame, { binary: true }, (error) => {
+                if (error) {
+                    sendCallbackError = error;
+                    serverFrameTelemetry.sendErrors++;
+                    const target = tunnelRequest === undefined
+                        ? "unknown target"
+                        : `${tunnelRequest.host}:${tunnelRequest.port}`;
+                    console.error(`WebSocket send error for ${target}:`, error.message);
+                }
+                if (error && webSocket.readyState === WebSocket.OPEN) {
+                    closeBoth(1011, "WebSocket send failed");
+                    return;
+                }
+                // The callback and the post-send path both use the same
+                // low-water transition so a synchronous callback cannot race
+                // a later high-water assertion into a lost drain.
+                resumeServerFrameIfLowWater();
+            });
+        }
+        catch (error) {
+            serverFrameTelemetry.sendErrors++;
+            console.error("WebSocket send failed:", error instanceof Error ? error.message : error);
+            closeBoth(1011, "WebSocket send failed");
+            return serverFrameForwardResult.ERROR;
+        }
+        if (sendCallbackError !== undefined) {
+            return serverFrameForwardResult.ERROR;
+        }
+        serverFrameTelemetry.enqueuedFrames++;
+        serverFrameTelemetry.enqueuedBytes += frameBytes;
+        const bufferedAmount = observeWebSocketBufferedAmount();
+        let pausedByThisSend = false;
+        if (bufferedAmount >= maximumWebSocketBufferedBytes) {
+            pauseTcpForWebSocket();
+            pausedByThisSend = true;
+        }
+        // This second call is intentional: ws test doubles can invoke the
+        // callback synchronously before send() returns.
+        resumeServerFrameIfLowWater();
+        return pausedByThisSend || tcpPausedForWebSocket
+            ? serverFrameForwardResult.ENQUEUED_PAUSED
+            : serverFrameForwardResult.ENQUEUED;
     };
     webSocket.on("message", () => {
         lastActivity = Date.now();
@@ -737,7 +1004,168 @@ webSocketServer.on("connection", (webSocket) => {
                     remoteAddress: tcpSocket.remoteAddress ?? null,
                     remotePort: tcpSocket.remotePort ?? null,
                 }));
+                const isEnqueuedServerFrameResult = (result) =>
+                    result === serverFrameForwardResult.ENQUEUED ||
+                    result === serverFrameForwardResult.ENQUEUED_PAUSED;
+                drainServerFrameBuffer = () => {
+                    if (serverFrameDrainRunning || tunnelCancelled || !connected ||
+                        tcpSocket === undefined || tcpSocket.destroyed ||
+                        webSocket.readyState !== WebSocket.OPEN || tcpPausedForWebSocket ||
+                        tcpPausedForClient) {
+                        return;
+                    }
+                    const drainStartedWithReadHold = serverFrameDrainHoldingRead;
+                    serverFrameDrainRunning = true;
+                    try {
+                        while (serverFrameBuffer.byteLength > 0 &&
+                            !tcpPausedForWebSocket && !tcpPausedForClient && !tunnelCancelled) {
+                            if (!packetFramingEnabled) {
+                                const opaqueChunk = serverFrameBuffer;
+                                if (proxyVanillaKeepAlive(
+                                    tcpSocket,
+                                    opaqueChunk,
+                                    protocolPhase,
+                                    minecraftProfile,
+                                )) {
+                                    replaceServerFrameBuffer(Buffer.alloc(0));
+                                    continue;
+                                }
+                                const result = forwardServerFrame(opaqueChunk);
+                                if (isEnqueuedServerFrameResult(result)) {
+                                    // Ownership transfers to ws only after
+                                    // send() accepted the bytes.
+                                    replaceServerFrameBuffer(Buffer.alloc(0));
+                                }
+                                else if (result === serverFrameForwardResult.CLOSED ||
+                                    result === serverFrameForwardResult.ERROR) {
+                                    clearServerFrameState();
+                                }
+                                if (result !== serverFrameForwardResult.ENQUEUED) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            const parsed = readMinecraftFrame(serverFrameBuffer);
+                            if (parsed === undefined) {
+                                break;
+                            }
+                            if (parsed === null) {
+                                // This is normally encrypted online-mode traffic.
+                                // Keep the opaque bytes in order and send them as
+                                // one frame once the current high-water pause clears.
+                                packetFramingEnabled = false;
+                                minecraftProfile = undefined;
+                                clearClientStallTimer();
+                                traceTunnelEvent("disabled keepalive proxy for opaque server traffic");
+                                const opaqueChunk = serverFrameBuffer;
+                                const result = forwardServerFrame(opaqueChunk);
+                                if (isEnqueuedServerFrameResult(result)) {
+                                    replaceServerFrameBuffer(Buffer.alloc(0));
+                                }
+                                else if (result === serverFrameForwardResult.CLOSED ||
+                                    result === serverFrameForwardResult.ERROR) {
+                                    clearServerFrameState();
+                                }
+                                break;
+                            }
+                            if (traceTunnel && protocolPhase === "play") {
+                                const packet = minecraftPacketId(parsed.frame, parsed.headerBytes);
+                                if (packet !== undefined) {
+                                    lastServerPlayPacket =
+                                        `0x${packet.id.toString(16)}/${parsed.frame.byteLength}`;
+                                }
+                            }
+                            if (protocolPhase === "play" &&
+                                isPayloadlessPacket(
+                                    parsed.frame,
+                                    parsed.headerBytes,
+                                    minecraftProfile.play.clientboundStartConfiguration,
+                                )) {
+                                protocolPhase = "reconfiguring";
+                                clearClientStallTimer();
+                                traceTunnelEvent("server started PLAY to CONFIGURATION transition");
+                            }
+                            if (isLoginEncryptionRequest(parsed.frame, parsed.headerBytes)) {
+                                encryptionResponsePending = true;
+                            }
+                            traceCustomPayload(
+                                parsed.frame,
+                                parsed.headerBytes,
+                                "server",
+                                protocolPhase === "play",
+                                minecraftProfile,
+                            );
+                            if (proxyVanillaKeepAlive(
+                                tcpSocket,
+                                parsed.frame,
+                                protocolPhase,
+                                minecraftProfile,
+                            )) {
+                                replaceServerFrameBuffer(parsed.remainder);
+                                continue;
+                            }
+                            let result;
+                            serverFrameInFlightFrameBytes = parsed.frame.byteLength;
+                            try {
+                                result = forwardServerFrame(parsed.frame);
+                            }
+                            finally {
+                                serverFrameInFlightFrameBytes = 0;
+                            }
+                            if (isEnqueuedServerFrameResult(result)) {
+                                // Do not drop parsed.remainder until the
+                                // frame itself is confirmed enqueued.
+                                replaceServerFrameBuffer(parsed.remainder);
+                            }
+                            else if (result === serverFrameForwardResult.PAUSED) {
+                                // The complete frame and its remainder are
+                                // still owned by the relay; retry in order.
+                                break;
+                            }
+                            else {
+                                clearServerFrameState();
+                                break;
+                            }
+                            if (result !== serverFrameForwardResult.ENQUEUED) {
+                                break;
+                            }
+                        }
+                    }
+                    finally {
+                        serverFrameDrainRunning = false;
+                        serverFrameTelemetry.drainCompletions++;
+                        if (drainStartedWithReadHold) {
+                            serverFrameTelemetry.dataCallbacksAtDrainCompletion =
+                                serverFrameTelemetry.dataCallbacks;
+                        }
+                        if (drainStartedWithReadHold && serverFrameDrainHoldingRead &&
+                            !tcpPausedForWebSocket &&
+                            !tcpPausedForClient && !tunnelCancelled) {
+                            updateRetainedCompleteFrameTelemetry();
+                            // An active drain either exhausted the retained
+                            // bytes or reached an incomplete frame. In both
+                            // cases the next TCP data callback is required to
+                            // make progress, so release the read hold now.
+                            serverFrameDrainHoldingRead = false;
+                            updateTcpReadState();
+                        }
+                        const rescheduleRequested = serverFrameDrainRescheduleRequested;
+                        serverFrameDrainRescheduleRequested = false;
+                        if (rescheduleRequested && !tcpPausedForWebSocket &&
+                            !tunnelCancelled && serverFrameBuffer.byteLength > 0) {
+                            scheduleServerFrameDrain();
+                        }
+                        if (serverFrameDrainHoldingRead && !tcpPausedForWebSocket &&
+                            !tcpPausedForClient && !tunnelCancelled &&
+                            serverFrameBuffer.byteLength === 0) {
+                            updateRetainedCompleteFrameTelemetry(0);
+                            serverFrameDrainHoldingRead = false;
+                            updateTcpReadState();
+                        }
+                    }
+                };
                 tcpSocket.on("data", (chunk) => {
+                    serverFrameTelemetry.dataCallbacks++;
                     // Hex previews are diagnostic-only. Building them on every PLAY chunk
                     // needlessly taxes the RelayNode even when tunnel tracing is disabled.
                     if (traceTunnel) {
@@ -747,67 +1175,20 @@ webSocketServer.on("connection", (webSocket) => {
                         );
                     }
                     lastActivity = Date.now();
-                    if (!packetFramingEnabled) {
+                    if (!packetFramingEnabled && serverFrameBuffer.byteLength === 0 &&
+                        !tcpPausedForWebSocket && !tcpPausedForClient) {
                         if (proxyVanillaKeepAlive(tcpSocket, chunk, protocolPhase, minecraftProfile)) {
                             return;
                         }
+                        // There is no parser remainder in the opaque path, so a
+                        // successful send needs no queue bookkeeping.
                         forwardServerFrame(chunk);
                         return;
                     }
-                    serverFrameBuffer = serverFrameBuffer.byteLength === 0
+                    replaceServerFrameBuffer(serverFrameBuffer.byteLength === 0
                         ? chunk
-                        : Buffer.concat([serverFrameBuffer, chunk]);
-                    while (serverFrameBuffer.byteLength > 0) {
-                        const parsed = readMinecraftFrame(serverFrameBuffer);
-                        if (parsed === undefined) {
-                            return;
-                        }
-                        if (parsed === null) {
-                            // This is normally encrypted online-mode traffic.
-                            packetFramingEnabled = false;
-                            minecraftProfile = undefined;
-                            clearClientStallTimer();
-                            traceTunnelEvent("disabled keepalive proxy for opaque server traffic");
-                            forwardServerFrame(serverFrameBuffer);
-                            serverFrameBuffer = Buffer.alloc(0);
-                            return;
-                        }
-                        serverFrameBuffer = parsed.remainder;
-                        if (traceTunnel && protocolPhase === "play") {
-                            const packet = minecraftPacketId(parsed.frame, parsed.headerBytes);
-                            if (packet !== undefined) {
-                                lastServerPlayPacket = `0x${packet.id.toString(16)}/${parsed.frame.byteLength}`;
-                            }
-                        }
-                        if (protocolPhase === "play" &&
-                            isPayloadlessPacket(
-                                parsed.frame,
-                                parsed.headerBytes,
-                                minecraftProfile.play.clientboundStartConfiguration
-                            )) {
-                            protocolPhase = "reconfiguring";
-                            clearClientStallTimer();
-                            traceTunnelEvent("server started PLAY to CONFIGURATION transition");
-                        }
-                        if (isLoginEncryptionRequest(parsed.frame, parsed.headerBytes)) {
-                            encryptionResponsePending = true;
-                        }
-                        traceCustomPayload(
-                            parsed.frame,
-                            parsed.headerBytes,
-                            "server",
-                            protocolPhase === "play",
-                            minecraftProfile
-                        );
-                        if (!proxyVanillaKeepAlive(
-                            tcpSocket,
-                            parsed.frame,
-                            protocolPhase,
-                            minecraftProfile
-                        )) {
-                            forwardServerFrame(parsed.frame);
-                        }
-                    }
+                        : Buffer.concat([serverFrameBuffer, chunk]));
+                    drainServerFrameBuffer();
                 });
                 tcpSocket.once("error", (error) => {
                     console.error("TCP tunnel error:", error.message);
@@ -848,6 +1229,9 @@ webSocketServer.on("connection", (webSocket) => {
                         tcpPausedForClient = message.paused;
                         updateTcpReadState();
                         webSocket.send(JSON.stringify({ type: "flow", paused: tcpPausedForClient }));
+                        if (!tcpPausedForClient) {
+                            scheduleServerFrameDrain();
+                        }
                     }
                     catch {
                         closeBoth(1003, "Invalid tunnel control message");
@@ -1024,10 +1408,13 @@ webSocketServer.on("connection", (webSocket) => {
                     packetFramingEnabled = false;
                     minecraftProfile = undefined;
                     encryptionResponsePending = false;
-                    serverFrameBuffer = Buffer.alloc(0);
                     clientFrameBuffer = Buffer.alloc(0);
                     clearClientStallTimer();
                     traceTunnelEvent("disabled keepalive proxy after login encryption response");
+                    // Keep any complete/partial server bytes retained by a
+                    // high-water pause. They are now opaque encrypted bytes,
+                    // not disposable parser state, and must drain in order.
+                    scheduleServerFrameDrain();
                 }
                 if (!tcpSocket.write(clientData)) {
                     webSocket.pause();
@@ -1051,6 +1438,7 @@ webSocketServer.on("connection", (webSocket) => {
         clearInterval(idleTimer);
         clearClientStallTimer();
         tunnelCancelled = true;
+        clearServerFrameState();
         tunnelConnectAbortController.abort();
         releaseTargetRoute();
         tcpSocket?.destroy();
