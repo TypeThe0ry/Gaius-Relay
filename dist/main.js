@@ -37,6 +37,10 @@ const maximumAuthRequestBytes = 1024 * 1024;
 const maximumRealmsResponseBytes = 16 * 1024 * 1024;
 const maximumRealmsRequestBytes = 4 * 1024 * 1024;
 const maximumWebSocketBufferedBytes = 4 * 1024 * 1024;
+// Handshakes are tiny (the host field is capped at 255 bytes), but a generic
+// TCP tunnel can arrive one WebSocket message at a time. Keep only a bounded
+// sniffing buffer and fall back to opaque forwarding once it is exceeded.
+const maximumMinecraftHandshakeBytes = 4 * 1024;
 const resourcePackBodyAttempts = 3;
 const localTunnelWaitMs = 10 * 60 * 1000;
 const relayCapabilities = [
@@ -73,6 +77,11 @@ const resourcePackTemporaryPaths = new Set();
 let resourcePackCacheBytes = 0;
 const relayStartedAt = Date.now();
 let activeClientStallTimers = 0;
+let syntheticPlayTickWrites = 0;
+let syntheticPlayTickBackpressureEvents = 0;
+let syntheticPlayTickMaxWritableLength = 0;
+let pendingSyntheticPlayTicks = 0;
+let maxPendingSyntheticPlayTicks = 0;
 const relayRegistrationState = {
     configured: config.registration !== undefined,
     registered: false,
@@ -298,44 +307,63 @@ function createPayloadlessMinecraftFrame(packetId, compressed) {
     return Buffer.concat([encodeMinecraftVarInt(body.byteLength), body]);
 }
 
-function parseMinecraftHandshake(frame) {
+function inspectMinecraftHandshake(frame) {
     const parsed = readMinecraftFrame(frame);
     if (parsed === undefined || parsed === null) {
-        return undefined;
+        return {
+            state: parsed === undefined ? "incomplete" : "opaque",
+        };
     }
     const packetOffset = parsed.headerBytes;
     const packetId = decodeMinecraftVarInt(parsed.frame, packetOffset);
     if (packetId === undefined || packetId === null || packetId.value !== 0) {
-        return undefined;
+        return { state: "opaque" };
     }
     let offset = packetOffset + packetId.bytesRead;
     const protocolVersion = decodeMinecraftVarInt(parsed.frame, offset);
     if (protocolVersion === undefined || protocolVersion === null) {
-        return undefined;
+        return { state: "opaque" };
     }
     offset += protocolVersion.bytesRead;
     const hostLength = decodeMinecraftVarInt(parsed.frame, offset);
     if (hostLength === undefined || hostLength === null ||
         hostLength.value > 255) {
-        return undefined;
+        return { state: "opaque" };
     }
     offset += hostLength.bytesRead;
     const hostEnd = offset + hostLength.value;
     if (hostEnd + 2 > parsed.frame.byteLength) {
-        return undefined;
+        return { state: "opaque" };
     }
     offset = hostEnd + 2;
     const nextState = decodeMinecraftVarInt(parsed.frame, offset);
     if (nextState === undefined || nextState === null ||
         (nextState.value !== 1 && nextState.value !== 2) ||
         offset + nextState.bytesRead !== parsed.frame.byteLength) {
-        return undefined;
+        return { state: "opaque" };
     }
     return {
-        protocolVersion: protocolVersion.value,
-        profile: resolveMinecraftProfile(protocolVersion.value),
-        remainder: parsed.remainder,
+        state: "complete",
+        handshake: {
+            protocolVersion: protocolVersion.value,
+            profile: resolveMinecraftProfile(protocolVersion.value),
+            remainder: parsed.remainder,
+        },
     };
+}
+
+function parseMinecraftHandshake(frame) {
+    const result = inspectMinecraftHandshake(frame);
+    return result.state === "complete" ? result.handshake : undefined;
+}
+
+function isDefinitelyNotMinecraftHandshake(buffer) {
+    const length = decodeMinecraftVarInt(buffer, 0);
+    if (length === undefined || length === null) {
+        return length === null;
+    }
+    const packetId = decodeMinecraftVarInt(buffer, length.bytesRead);
+    return packetId !== undefined && packetId !== null && packetId.value !== 0;
 }
 
 function minecraftPacketId(frame, headerBytes) {
@@ -394,6 +422,12 @@ function relayRuntimeSnapshot() {
     return {
         uptimeMillis: Math.max(0, Date.now() - relayStartedAt),
         activeClientStallTimers,
+        activeLocalTunnelSessions: localTunnelSessions.size,
+        syntheticPlayTickWrites,
+        syntheticPlayTickBackpressureEvents,
+        syntheticPlayTickMaxWritableLength,
+        pendingSyntheticPlayTicks,
+        maxPendingSyntheticPlayTicks,
         rssBytes: memory.rss,
         heapUsedBytes: memory.heapUsed,
         externalBytes: memory.external,
@@ -465,6 +499,7 @@ webSocketServer.on("connection", (webSocket) => {
     let configurationCycles = 0;
     let serverFrameBuffer = Buffer.alloc(0);
     let clientFrameBuffer = Buffer.alloc(0);
+    let minecraftHandshakeBuffer = Buffer.alloc(0);
     // The first Minecraft handshake selects the packet-id table. Do not assume
     // the legacy table before that handshake: an unknown or malformed profile
     // must stay an opaque raw TCP tunnel rather than receive a guessed rewrite.
@@ -481,6 +516,8 @@ webSocketServer.on("connection", (webSocket) => {
     let playTickFrame;
     let lastClientTrafficAt = Date.now();
     let clientStallTimer;
+    let syntheticTickPending = false;
+    let syntheticTickDrainListener;
     let tunnelCancelled = false;
     const tunnelConnectAbortController = new AbortController();
     let lastActivity = Date.now();
@@ -490,13 +527,95 @@ webSocketServer.on("connection", (webSocket) => {
         }
     }, Math.min(config.idleTimeoutMs, 5_000));
     idleTimer.unref();
+    const clearSyntheticTickState = () => {
+        if (syntheticTickDrainListener !== undefined && tcpSocket !== undefined) {
+            tcpSocket.off("drain", syntheticTickDrainListener);
+            syntheticTickDrainListener = undefined;
+        }
+        if (syntheticTickPending) {
+            syntheticTickPending = false;
+            pendingSyntheticPlayTicks = Math.max(0, pendingSyntheticPlayTicks - 1);
+        }
+    };
+    const armSyntheticTickDrain = () => {
+        if (syntheticTickDrainListener !== undefined || tcpSocket === undefined ||
+            tcpSocket.destroyed) {
+            return;
+        }
+        const socket = tcpSocket;
+        syntheticTickDrainListener = () => {
+            syntheticTickDrainListener = undefined;
+            if (!syntheticTickPending) {
+                return;
+            }
+            syntheticTickPending = false;
+            pendingSyntheticPlayTicks = Math.max(0, pendingSyntheticPlayTicks - 1);
+            if (connected && protocolPhase === "play" && playTickFrame !== undefined &&
+                tcpSocket === socket && Date.now() - lastClientTrafficAt >= stalledClientTickGraceMs) {
+                writeSyntheticPlayTick();
+            }
+        };
+        socket.once("drain", syntheticTickDrainListener);
+    };
+    const writeSyntheticPlayTick = () => {
+        if (!connected || protocolPhase !== "play" || playTickFrame === undefined ||
+            tcpSocket === undefined || tcpSocket.destroyed || tcpSocket.writable === false) {
+            return;
+        }
+        const writableLength = Number(tcpSocket.writableLength);
+        if (Number.isFinite(writableLength)) {
+            syntheticPlayTickMaxWritableLength = Math.max(
+                syntheticPlayTickMaxWritableLength,
+                writableLength,
+            );
+        }
+        // A previous false write or an already asserted writableNeedDrain means
+        // exactly one tick is pending. Do not enqueue a second copy on the next
+        // interval; the drain callback sends it after the reader catches up.
+        if (syntheticTickPending || tcpSocket.writableNeedDrain === true) {
+            if (!syntheticTickPending) {
+                syntheticTickPending = true;
+                pendingSyntheticPlayTicks++;
+                maxPendingSyntheticPlayTicks = Math.max(
+                    maxPendingSyntheticPlayTicks,
+                    pendingSyntheticPlayTicks,
+                );
+                syntheticPlayTickBackpressureEvents++;
+            }
+            armSyntheticTickDrain();
+            return;
+        }
+        const accepted = tcpSocket.write(playTickFrame);
+        syntheticPlayTickWrites++;
+        const postWriteLength = Number(tcpSocket.writableLength);
+        if (Number.isFinite(postWriteLength)) {
+            syntheticPlayTickMaxWritableLength = Math.max(
+                syntheticPlayTickMaxWritableLength,
+                postWriteLength,
+            );
+        }
+        lastClientTrafficAt = Date.now();
+        traceTunnelEvent("proxied observed play tick while browser was stalled");
+        if (!accepted || tcpSocket.writableNeedDrain === true) {
+            syntheticTickPending = true;
+            pendingSyntheticPlayTicks++;
+            maxPendingSyntheticPlayTicks = Math.max(
+                maxPendingSyntheticPlayTicks,
+                pendingSyntheticPlayTicks,
+            );
+            syntheticPlayTickBackpressureEvents++;
+            armSyntheticTickDrain();
+        }
+    };
     const clearClientStallTimer = () => {
         if (clientStallTimer === undefined) {
+            clearSyntheticTickState();
             return;
         }
         clearInterval(clientStallTimer);
         clientStallTimer = undefined;
         activeClientStallTimers = Math.max(0, activeClientStallTimers - 1);
+        clearSyntheticTickState();
     };
     const armClientStallTimer = () => {
         if (clientStallTimer !== undefined || playTickFrame === undefined) {
@@ -508,9 +627,7 @@ webSocketServer.on("connection", (webSocket) => {
                 Date.now() - lastClientTrafficAt < stalledClientTickGraceMs) {
                 return;
             }
-            tcpSocket.write(playTickFrame);
-            lastClientTrafficAt = Date.now();
-            traceTunnelEvent("proxied observed play tick while browser was stalled");
+            writeSyntheticPlayTick();
         }, stalledClientTickIntervalMs);
         clientStallTimer.unref();
         activeClientStallTimers++;
@@ -745,30 +862,79 @@ webSocketServer.on("connection", (webSocket) => {
                             + `head=${clientData.subarray(0, 24).toString("hex")}`
                     );
                 }
+                let frameClientData = clientData;
                 if (!packetFramingEnabled && config.proxyKeepAlives && !minecraftHandshakeSeen) {
-                    const handshake = parseMinecraftHandshake(clientData);
-                    if (handshake !== undefined) {
+                    let handshakeResult;
+                    if (minecraftHandshakeBuffer.byteLength + clientData.byteLength >
+                        maximumMinecraftHandshakeBytes) {
+                        // The probe is only for profile selection. The bytes have
+                        // already been queued exactly once below, so dropping the
+                        // bounded copy here preserves opaque tunnel semantics.
+                        handshakeResult = minecraftHandshakeBuffer.byteLength === 0 &&
+                            isDefinitelyNotMinecraftHandshake(clientData)
+                            ? { state: "raw" }
+                            : { state: "opaque" };
+                    }
+                    else {
+                        minecraftHandshakeBuffer = minecraftHandshakeBuffer.byteLength === 0
+                            ? clientData
+                            : Buffer.concat([minecraftHandshakeBuffer, clientData]);
+                        handshakeResult = isDefinitelyNotMinecraftHandshake(minecraftHandshakeBuffer)
+                            ? { state: "raw" }
+                            : inspectMinecraftHandshake(minecraftHandshakeBuffer);
+                    }
+                    if (handshakeResult.state === "incomplete" || handshakeResult.state === "raw") {
+                        // Keep forwarding the raw chunk below while retaining only
+                        // the bounded sniffing copy for an incomplete next message.
+                        frameClientData = undefined;
+                        if (handshakeResult.state === "raw") {
+                            // A non-Minecraft preamble is an opaque stream decision.
+                            // End the one-shot probe so a later byte sequence cannot
+                            // be promoted into a 774/776 profile handshake.
+                            minecraftHandshakeSeen = true;
+                            minecraftHandshakeBuffer = Buffer.alloc(0);
+                        }
+                    }
+                    else if (handshakeResult.state === "complete") {
+                        const handshake = handshakeResult.handshake;
                         minecraftHandshakeSeen = true;
+                        minecraftHandshakeBuffer = Buffer.alloc(0);
+                        frameClientData = handshake.remainder;
+                        if (handshake.profile === undefined) {
+                            // Unsupported versions remain a raw tunnel. A later
+                            // supported-looking packet must never reopen framing.
+                            minecraftProfile = undefined;
+                            frameClientData = undefined;
+                            traceTunnelEvent(
+                                `disabled profile-aware rewrites for unsupported Minecraft protocol `
+                                    + `${handshake.protocolVersion}`
+                            );
+                        }
+                        else {
+                            minecraftProfile = handshake.profile;
+                            packetFramingEnabled = true;
+                            traceTunnelEvent(
+                                `enabled framed keepalive proxy for Minecraft ${minecraftProfile.name}`
+                            );
+                        }
                     }
-                    if (handshake?.profile === undefined && handshake !== undefined) {
+                    else {
+                        minecraftHandshakeSeen = true;
+                        minecraftHandshakeBuffer = Buffer.alloc(0);
                         minecraftProfile = undefined;
+                        frameClientData = undefined;
                         traceTunnelEvent(
-                            `disabled profile-aware rewrites for unsupported Minecraft protocol `
-                                + `${handshake.protocolVersion}`
-                        );
-                    }
-                    else if (handshake?.profile !== undefined) {
-                        minecraftProfile = handshake.profile;
-                        packetFramingEnabled = true;
-                        traceTunnelEvent(
-                            `enabled framed keepalive proxy for Minecraft ${minecraftProfile.name}`
+                            "disabled profile-aware rewrites for opaque or malformed Minecraft traffic"
                         );
                     }
                 }
-                if (packetFramingEnabled) {
+                if (packetFramingEnabled && frameClientData !== undefined) {
+                    // The legacy path used Buffer.concat([clientFrameBuffer, clientData]);
+                    // handshake probing now supplies only the post-handshake
+                    // remainder so the raw handshake is never inspected twice.
                     clientFrameBuffer = clientFrameBuffer.byteLength === 0
-                        ? clientData
-                        : Buffer.concat([clientFrameBuffer, clientData]);
+                        ? frameClientData
+                        : Buffer.concat([clientFrameBuffer, frameClientData]);
                     while (clientFrameBuffer.byteLength > 0) {
                         const parsed = readMinecraftFrame(clientFrameBuffer);
                         if (parsed === undefined) {
@@ -1303,12 +1469,20 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
         }
         const peer = endpoint.peer;
         endpoint.peer = undefined;
-        if (peer !== undefined && !peer.closed) {
+        if (peer !== undefined) {
+            // Clearing only the endpoint that observed `close` leaves the
+            // peer's role slot occupied by a closed object. A same-session
+            // reconnect then looks like a duplicate and the session map leaks.
+            if (current?.[peer.role] === peer) {
+                current[peer.role] = undefined;
+            }
             peer.peer = undefined;
-            peer.closed = true;
-            if (peer.webSocket.readyState === WebSocket.OPEN ||
-                peer.webSocket.readyState === WebSocket.CONNECTING) {
-                peer.webSocket.close(1000, "Local tunnel peer closed");
+            if (!peer.closed) {
+                peer.closed = true;
+                if (peer.webSocket.readyState === WebSocket.OPEN ||
+                    peer.webSocket.readyState === WebSocket.CONNECTING) {
+                    peer.webSocket.close(1000, "Local tunnel peer closed");
+                }
             }
         }
         if (current !== undefined && current.client === undefined && current.server === undefined) {
