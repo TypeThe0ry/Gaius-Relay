@@ -51,6 +51,7 @@ const relayCapabilities = [
     "resource-pack-cache",
     "public-target-guard",
     "target-attestation",
+    "runtime-telemetry",
 ];
 // `ServerboundClientTickEndPacket` is emitted once per client tick. A resource
 // or model reload can temporarily stop browser ticks, while a spawn proxy can
@@ -70,6 +71,8 @@ const targetRoutes = new Map();
 const resourcePackCache = new Map();
 const resourcePackTemporaryPaths = new Set();
 let resourcePackCacheBytes = 0;
+const relayStartedAt = Date.now();
+let activeClientStallTimers = 0;
 const relayRegistrationState = {
     configured: config.registration !== undefined,
     registered: false,
@@ -385,6 +388,19 @@ function traceTunnelEvent(message) {
         console.info(`[Gaius tunnel trace] ${message}`);
     }
 }
+function relayRuntimeSnapshot() {
+    const memory = process.memoryUsage();
+    const cpu = process.cpuUsage();
+    return {
+        uptimeMillis: Math.max(0, Date.now() - relayStartedAt),
+        activeClientStallTimers,
+        rssBytes: memory.rss,
+        heapUsedBytes: memory.heapUsed,
+        externalBytes: memory.external,
+        cpuUserMicros: cpu.user,
+        cpuSystemMicros: cpu.system,
+    };
+}
 const allowedAuthHosts = new Set([
     "api.minecraftservices.com",
     "api.mojang.com",
@@ -474,10 +490,35 @@ webSocketServer.on("connection", (webSocket) => {
         }
     }, Math.min(config.idleTimeoutMs, 5_000));
     idleTimer.unref();
+    const clearClientStallTimer = () => {
+        if (clientStallTimer === undefined) {
+            return;
+        }
+        clearInterval(clientStallTimer);
+        clientStallTimer = undefined;
+        activeClientStallTimers = Math.max(0, activeClientStallTimers - 1);
+    };
+    const armClientStallTimer = () => {
+        if (clientStallTimer !== undefined || playTickFrame === undefined) {
+            return;
+        }
+        clientStallTimer = setInterval(() => {
+            if (!connected || protocolPhase !== "play" || playTickFrame === undefined ||
+                tcpSocket === undefined ||
+                Date.now() - lastClientTrafficAt < stalledClientTickGraceMs) {
+                return;
+            }
+            tcpSocket.write(playTickFrame);
+            lastClientTrafficAt = Date.now();
+            traceTunnelEvent("proxied observed play tick while browser was stalled");
+        }, stalledClientTickIntervalMs);
+        clientStallTimer.unref();
+        activeClientStallTimers++;
+    };
     const closeBoth = (code, reason) => {
         traceTunnelEvent(`closing tunnel code=${code} reason=${reason}`);
         clearInterval(idleTimer);
-        clearInterval(clientStallTimer);
+        clearClientStallTimer();
         tunnelCancelled = true;
         tunnelConnectAbortController.abort();
         releaseTargetRoute();
@@ -498,16 +539,6 @@ webSocketServer.on("connection", (webSocket) => {
             tcpSocket.resume();
         }
     };
-    clientStallTimer = setInterval(() => {
-        if (!connected || protocolPhase !== "play" || playTickFrame === undefined ||
-            tcpSocket === undefined || Date.now() - lastClientTrafficAt < stalledClientTickGraceMs) {
-            return;
-        }
-        tcpSocket.write(playTickFrame);
-        lastClientTrafficAt = Date.now();
-        traceTunnelEvent("proxied observed play tick while browser was stalled");
-    }, stalledClientTickIntervalMs);
-    clientStallTimer.unref();
     const forwardServerFrame = (frame) => {
         if (webSocket.readyState !== WebSocket.OPEN) {
             return;
@@ -618,6 +649,7 @@ webSocketServer.on("connection", (webSocket) => {
                             // This is normally encrypted online-mode traffic.
                             packetFramingEnabled = false;
                             minecraftProfile = undefined;
+                            clearClientStallTimer();
                             traceTunnelEvent("disabled keepalive proxy for opaque server traffic");
                             forwardServerFrame(serverFrameBuffer);
                             serverFrameBuffer = Buffer.alloc(0);
@@ -637,6 +669,7 @@ webSocketServer.on("connection", (webSocket) => {
                                 minecraftProfile.play.clientboundStartConfiguration
                             )) {
                             protocolPhase = "reconfiguring";
+                            clearClientStallTimer();
                             traceTunnelEvent("server started PLAY to CONFIGURATION transition");
                         }
                         if (isLoginEncryptionRequest(parsed.frame, parsed.headerBytes)) {
@@ -745,6 +778,7 @@ webSocketServer.on("connection", (webSocket) => {
                             packetFramingEnabled = false;
                             minecraftProfile = undefined;
                             clientFrameBuffer = Buffer.alloc(0);
+                            clearClientStallTimer();
                             traceTunnelEvent("disabled keepalive proxy for opaque client traffic");
                             break;
                         }
@@ -782,6 +816,7 @@ webSocketServer.on("connection", (webSocket) => {
                                     `re-entered PLAY after configuration cycle ${configurationCycles}`
                                 );
                             }
+                            armClientStallTimer();
                         }
                         else if ((protocolPhase === "play" ||
                             protocolPhase === "reconfiguring") &&
@@ -792,6 +827,7 @@ webSocketServer.on("connection", (webSocket) => {
                             )) {
                             protocolPhase = "configuration";
                             lastClientTrafficAt = Date.now();
+                            clearClientStallTimer();
                             traceTunnelEvent("client acknowledged PLAY to CONFIGURATION transition");
                         }
                         if (traceTunnel && protocolPhase === "play") {
@@ -824,6 +860,7 @@ webSocketServer.on("connection", (webSocket) => {
                     encryptionResponsePending = false;
                     serverFrameBuffer = Buffer.alloc(0);
                     clientFrameBuffer = Buffer.alloc(0);
+                    clearClientStallTimer();
                     traceTunnelEvent("disabled keepalive proxy after login encryption response");
                 }
                 if (!tcpSocket.write(clientData)) {
@@ -846,7 +883,7 @@ webSocketServer.on("connection", (webSocket) => {
             `WebSocket closed code=${code} reason=${reason.toString()} connected=${connected}`
         );
         clearInterval(idleTimer);
-        clearInterval(clientStallTimer);
+        clearClientStallTimer();
         tunnelCancelled = true;
         tunnelConnectAbortController.abort();
         releaseTargetRoute();
@@ -1644,6 +1681,7 @@ function handleRelayNodeManifest(request, response, requestUrl) {
             maximumBytes: config.maximumResourcePackCacheBytes,
             ttlMs: config.resourcePackCacheMs,
         },
+        runtime: relayRuntimeSnapshot(),
         ...(target === undefined ? {} : { target: targetRouteSnapshot(target) }),
         registration: {
             configured: relayRegistrationState.configured,

@@ -160,9 +160,11 @@ different location. `GAIUS_BROWSER_FULL_PATH_CLIENTS` (1--4) and
 `GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS` defaults to 9 (range 1--128) and gates
 every client on that many PLAY chunk packets. The JSON evidence records
 relay/login/configuration/PLAY/first-chunk timing, packet and byte rates, queue
-cleanup, WebSocket cleanup, and target-lease cleanup for both protocol 776 and
-774. MSYS `/c/...` paths are accepted for the profile, archive, and Java environment
-variables. Evidence and logs remain under
+cleanup, WebSocket cleanup, target-lease cleanup, and RelayNode CPU/RSS deltas
+for both protocol 776 and 774. Online-mode evidence also fails if the encrypted
+PLAY tunnels arm the offline stall-tick interval; those timers are now created
+only after a framed connection actually enters PLAY. MSYS `/c/...` paths are
+accepted for the profile, archive, and Java environment variables. Evidence and logs remain under
 `port/target/<profile>/browser-relay-full-path-evidence/`.
 
 The harness evaluates the source `BrowserWebSocketChannel` JSBody with Node's
