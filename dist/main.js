@@ -38,6 +38,12 @@ const maximumAuthRequestBytes = 1024 * 1024;
 const maximumRealmsResponseBytes = 16 * 1024 * 1024;
 const maximumRealmsRequestBytes = 4 * 1024 * 1024;
 const maximumWebSocketBufferedBytes = 4 * 1024 * 1024;
+// A PLAY/chunk burst must not monopolize the RelayNode event loop while a
+// single TCP data callback drains every complete frame.  Frames remain
+// ordered; the existing setImmediate continuation carries the remainder.
+const maximumServerFrameDrainFrames = 32;
+const maximumServerFrameDrainBytes = 512 * 1024;
+const maximumServerFrameDrainMillis = 2;
 // Handshakes are tiny (the host field is capped at 255 bytes), but a generic
 // TCP tunnel can arrive one WebSocket message at a time. Keep only a bounded
 // sniffing buffer and fall back to opaque forwarding once it is exceeded.
@@ -123,6 +129,10 @@ const serverFrameTelemetry = {
     maxBufferedAmount: 0,
     bufferedFrameBytes: 0,
     maxBufferedFrameBytes: 0,
+    drainBudgetYields: 0,
+    maxDrainFrames: 0,
+    maxDrainBytes: 0,
+    maxDrainDurationMillis: 0,
 };
 const clientFrameTelemetry = {
     appendedChunks: 0,
@@ -526,6 +536,10 @@ function relayRuntimeSnapshot() {
         serverFrameMaxBufferedAmount: serverFrameTelemetry.maxBufferedAmount,
         serverFrameBufferedBytes: serverFrameTelemetry.bufferedFrameBytes,
         serverFrameMaxBufferedBytes: serverFrameTelemetry.maxBufferedFrameBytes,
+        serverFrameDrainBudgetYields: serverFrameTelemetry.drainBudgetYields,
+        serverFrameMaxDrainFrames: serverFrameTelemetry.maxDrainFrames,
+        serverFrameMaxDrainBytes: serverFrameTelemetry.maxDrainBytes,
+        serverFrameMaxDrainDurationMillis: serverFrameTelemetry.maxDrainDurationMillis,
         rssBytes: memory.rss,
         heapUsedBytes: memory.heapUsed,
         externalBytes: memory.external,
@@ -889,8 +903,6 @@ webSocketServer.on("connection", (webSocket) => {
             serverFrameDrainScheduled = false;
             releaseServerFrameDrainHandle();
             serverFrameTelemetry.scheduledDrains++;
-            serverFrameTelemetry.dataCallbacksAtDrainStart =
-                serverFrameTelemetry.dataCallbacks;
             drainServerFrameBuffer?.();
         });
     };
@@ -1058,10 +1070,30 @@ webSocketServer.on("connection", (webSocket) => {
                         return;
                     }
                     const drainStartedWithReadHold = serverFrameDrainHoldingRead;
+                    const drainStartedAt = performance.now();
+                    let drainFrames = 0;
+                    let drainBytes = 0;
+                    let drainBudgetYielded = false;
+                    if (drainStartedWithReadHold) {
+                        serverFrameTelemetry.dataCallbacksAtDrainStart =
+                            serverFrameTelemetry.dataCallbacks;
+                    }
                     serverFrameDrainRunning = true;
                     try {
                         while (serverFrameBuffer.byteLength > 0 &&
                             !tcpPausedForWebSocket && !tcpPausedForClient && !tunnelCancelled) {
+                            // Always process at least one frame, even when it is
+                            // larger than the byte budget.  Subsequent frames
+                            // yield to the event loop through setImmediate.
+                            if (drainFrames > 0 &&
+                                (drainFrames >= maximumServerFrameDrainFrames ||
+                                    drainBytes >= maximumServerFrameDrainBytes ||
+                                    performance.now() - drainStartedAt >=
+                                        maximumServerFrameDrainMillis)) {
+                                drainBudgetYielded = true;
+                                serverFrameTelemetry.drainBudgetYields++;
+                                break;
+                            }
                             if (!packetFramingEnabled) {
                                 const opaqueChunk = serverFrameBuffer.peekChunk();
                                 if (opaqueChunk === undefined) {
@@ -1081,6 +1113,8 @@ webSocketServer.on("connection", (webSocket) => {
                                     // Ownership transfers to ws only after
                                     // send() accepted the bytes.
                                     consumeServerFrameBuffer(opaqueChunk.byteLength);
+                                    drainFrames++;
+                                    drainBytes += opaqueChunk.byteLength;
                                 }
                                 else if (result === serverFrameForwardResult.CLOSED ||
                                     result === serverFrameForwardResult.ERROR) {
@@ -1115,6 +1149,8 @@ webSocketServer.on("connection", (webSocket) => {
                             )) {
                                 observeServerFrameCoalescing(parsed);
                                 consumeServerFrameBuffer(parsed.frameBytes);
+                                drainFrames++;
+                                drainBytes += parsed.frameBytes;
                                 continue;
                             }
                             let result;
@@ -1130,6 +1166,8 @@ webSocketServer.on("connection", (webSocket) => {
                                 // frame itself is confirmed enqueued.
                                 observeServerFrameCoalescing(parsed);
                                 consumeServerFrameBuffer(parsed.frameBytes);
+                                drainFrames++;
+                                drainBytes += parsed.frameBytes;
                                 if (traceTunnel && protocolPhase === "play") {
                                     const packet = minecraftPacketId(parsed.frame, parsed.headerBytes);
                                     if (packet !== undefined) {
@@ -1173,6 +1211,14 @@ webSocketServer.on("connection", (webSocket) => {
                         }
                     }
                     finally {
+                        serverFrameTelemetry.maxDrainFrames = Math.max(
+                            serverFrameTelemetry.maxDrainFrames, drainFrames);
+                        serverFrameTelemetry.maxDrainBytes = Math.max(
+                            serverFrameTelemetry.maxDrainBytes, drainBytes);
+                        serverFrameTelemetry.maxDrainDurationMillis = Math.max(
+                            serverFrameTelemetry.maxDrainDurationMillis,
+                            performance.now() - drainStartedAt,
+                        );
                         serverFrameDrainRunning = false;
                         serverFrameTelemetry.drainCompletions++;
                         if (drainStartedWithReadHold) {
@@ -1189,6 +1235,9 @@ webSocketServer.on("connection", (webSocket) => {
                             // make progress, so release the read hold now.
                             serverFrameDrainHoldingRead = false;
                             updateTcpReadState();
+                        }
+                        if (drainBudgetYielded) {
+                            serverFrameDrainRescheduleRequested = true;
                         }
                         const rescheduleRequested = serverFrameDrainRescheduleRequested;
                         serverFrameDrainRescheduleRequested = false;
