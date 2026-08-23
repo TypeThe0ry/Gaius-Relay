@@ -235,7 +235,10 @@ npm run smoke:external-multiplayer
 This check drives the browser bridge's real WebSocket JSBody and Minecraft
 status protocol through every external tunnel. It records status RTT, target
 attestation, RelayNode active connections, browser queues, event-loop gaps, and
-zero-state cleanup. It is intentionally not LOGIN/PLAY evidence; use the
+zero-state cleanup. It also requires the deployed RelayNode runtime manifest to
+publish DNS cache counters and proves that the extra same-target clients reused
+an in-flight or short-lived lookup. A node without those counters is stale and
+fails closed. It is intentionally not LOGIN/PLAY evidence; use the
 strict full-path acceptance gate above for encrypted multiplayer, chunks,
 reconnect, and soak. `GAIUS_EXTERNAL_ENABLE_PING=1` enables an optional status
 ping probe and fails closed if the remote endpoint does not return every pong.

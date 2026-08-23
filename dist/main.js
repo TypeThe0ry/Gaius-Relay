@@ -73,6 +73,16 @@ function parseDnsTestInteger(value) {
 
 const localTunnelSessions = new Map();
 const targetRoutes = new Map();
+// Public target connects can arrive in one browser turn when several players
+// join the same server. Coalesce their DNS lookups and retain only filtered
+// public addresses for a short window. Failed lookups are never cached, and
+// the short TTL limits the impact of DNS changes or rebinding.
+const publicDnsCache = new Map();
+const publicDnsCacheTtlMs = 5_000;
+const maximumPublicDnsCacheEntries = 1024;
+let publicDnsCacheHits = 0;
+let publicDnsCacheMisses = 0;
+let publicDnsCacheInflightJoins = 0;
 const resourcePackCache = new Map();
 const resourcePackTemporaryPaths = new Set();
 let resourcePackCacheBytes = 0;
@@ -504,6 +514,10 @@ function relayRuntimeSnapshot() {
         clientFrameAppendedChunks: clientFrameTelemetry.appendedChunks,
         clientFrameCoalescedFrames: clientFrameTelemetry.coalescedFrames,
         clientFrameCoalescedBytes: clientFrameTelemetry.coalescedBytes,
+        publicDnsCacheEntries: publicDnsCache.size,
+        publicDnsCacheHits,
+        publicDnsCacheMisses,
+        publicDnsCacheInflightJoins,
         serverFrameBufferedCompleteFrames: serverFrameTelemetry.retainedCompleteFrames,
         serverFrameMaxBufferedCompleteFrames: serverFrameTelemetry.maxRetainedCompleteFrames,
         serverFramePauses: serverFrameTelemetry.pauses,
@@ -1740,15 +1754,7 @@ function publicTargetLookup(host, options, callback) {
     const lookupOptions = typeof options === "object" && options !== null
         ? {...options, all: true}
         : {family: options, all: true};
-    void lookupDnsWithRetries(host, lookupOptions).then(({addresses}) => {
-        const publicAddresses = addresses.filter(
-            (entry) => !isPrivateNetworkAddress(entry.address));
-        if (publicAddresses.length === 0) {
-            const denied = new Error("Target hostname resolves only to private addresses");
-            denied.code = "EACCES";
-            callback(denied);
-            return;
-        }
+    void resolvePublicAddresses(host, lookupOptions).then((publicAddresses) => {
         if (returnAll) {
             callback(null, publicAddresses);
         }
@@ -1756,6 +1762,65 @@ function publicTargetLookup(host, options, callback) {
             callback(null, publicAddresses[0].address, publicAddresses[0].family);
         }
     }, (error) => callback(error));
+}
+function resolvePublicAddresses(host, lookupOptions) {
+    const family = lookupOptions?.family ?? 0;
+    const key = `${String(host).trim().toLowerCase()}|${family}`;
+    const now = Date.now();
+    const cached = publicDnsCache.get(key);
+    if (cached?.addresses !== undefined && cached.expiresAt > now) {
+        publicDnsCacheHits++;
+        return Promise.resolve(cached.addresses);
+    }
+    if (cached?.promise !== undefined) {
+        publicDnsCacheInflightJoins++;
+        return cached.promise;
+    }
+    publicDnsCacheMisses++;
+    let promise;
+    promise = lookupDnsWithRetries(host, lookupOptions).then(({addresses}) => {
+        const publicAddresses = addresses.filter(
+            (entry) => !isPrivateNetworkAddress(entry.address));
+        if (publicAddresses.length === 0) {
+            const denied = new Error("Target hostname resolves only to private addresses");
+            denied.code = "EACCES";
+            throw denied;
+        }
+        publicDnsCache.set(key, {
+            addresses: publicAddresses,
+            expiresAt: Date.now() + publicDnsCacheTtlMs,
+        });
+        prunePublicDnsCache();
+        return publicAddresses;
+    }).catch((error) => {
+        const current = publicDnsCache.get(key);
+        if (current?.promise === promise) {
+            publicDnsCache.delete(key);
+        }
+        throw error;
+    });
+    publicDnsCache.set(key, {promise, expiresAt: 0});
+    prunePublicDnsCache();
+    return promise;
+}
+function prunePublicDnsCache() {
+    const now = Date.now();
+    for (const [key, entry] of publicDnsCache) {
+        if (entry.promise === undefined && entry.expiresAt <= now) {
+            publicDnsCache.delete(key);
+        }
+    }
+    while (publicDnsCache.size > maximumPublicDnsCacheEntries) {
+        const oldestKey = publicDnsCache.keys().next().value;
+        if (oldestKey === undefined) {
+            break;
+        }
+        const oldest = publicDnsCache.get(oldestKey);
+        if (oldest?.promise !== undefined) {
+            break;
+        }
+        publicDnsCache.delete(oldestKey);
+    }
 }
 async function lookupDnsWithRetries(host, options) {
     return withDnsRetries(`lookup ${host}`, () => lookupDns(host, options));
