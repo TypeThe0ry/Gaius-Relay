@@ -566,6 +566,12 @@ const webSocketServer = new WebSocketServer({
     perMessageDeflate: false,
 });
 httpServer.on("upgrade", (request, socket, head) => {
+    // Minecraft status, login, keepalive, and play packets are predominantly
+    // small frames. Disable Nagle on the browser-facing TCP leg as well as the
+    // target leg below, otherwise the RelayNode can add an avoidable delayed
+    // ACK/Nagle interval even when its queues are empty.
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 30_000);
     const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
     if (requestUrl.pathname !== "/tunnel") {
         socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
