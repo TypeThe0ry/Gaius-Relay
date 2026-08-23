@@ -150,13 +150,48 @@ npm run smoke:browser-full-path
 GAIUS_VERSION_PROFILE_PATH=versions/1.21.11.json npm run smoke:browser-full-path
 ```
 
-This check is intentionally not part of `npm run smoke` or ordinary CI: it
-starts Java and a real local RelayNode, and requires the profile-scoped vanilla
-archive at `port/target/<profile>/multiplayer-smoke-server/server-artifact.bin`. The archive
-must be a regular file whose SHA-1 matches the active profile; set
-`GAIUS_BROWSER_FULL_PATH_SERVER_archive` to an existing verified archive when using a
-different location. `GAIUS_BROWSER_FULL_PATH_CLIENTS` (1--4) and
-`GAIUS_BROWSER_FULL_PATH_SOAK_MS` tune the run.
+The strict dual-profile acceptance gate runs `26.2` first and `1.21.11` second
+with exactly 4 clients, 9 chunks, one real reconnect wave, and a 15,000 ms
+post-reconnect soak. It fails closed on suffixed/invalid gate parameters and
+returns one aggregate JSON record (nonzero if either profile fails):
+
+```sh
+npm run smoke:browser-full-path-acceptance
+```
+
+The acceptance runner owns the profile order (`26.2`, then `1.21.11`), the
+exact 4/9/15,000/1 gate, and a 600,000 ms per-profile wall-clock deadline.
+It removes inherited `GAIUS_*` tuning, registry/DNS/trace/private-network,
+target-affinity, and server-archive override variables before starting each child;
+only the profile Java candidates (`GAIUS_JAVA`, `GAIUS_JAVA_HOME`,
+`GAIUS_JAVA_21`, and `GAIUS_JAVA_25`) are preserved. It then injects fixed
+loopback test values. The child must report the executable and major actually
+probed: strict `1.21.11` requires Java major **21 exactly**, while strict
+`26.2` accepts Java major **25 or newer**. A candidate variable may name either
+the `java` executable or a JDK home (the resolver adds `bin/java`).
+
+This is separate from the standalone compatibility smoke. `npm run
+smoke:browser-full-path` (or a direct `GAIUS_VERSION_PROFILE_PATH=...` run)
+keeps its compatibility tuning and accepts a verified
+`GAIUS_BROWSER_FULL_PATH_SERVER_archive` override; those tuning and override
+variables do not change the strict runner's fixed contract. The aggregate
+acceptance JSON has `actual` and `observed` copied only from independently
+validated child acceptance sections, while `runs` contains process/timeout
+diagnostics.
+
+Each profile result includes the required-versus-observed/actual soak and wave
+health, per-client online RSA/AES fail-closed evidence, canonical profile tuple,
+actual server-archive SHA-1, browser/RelayNode/target active counts, and explicit
+RelayNode runtime-gauge/synthetic-marker evidence.
+
+This strict check is intentionally not part of `npm run smoke` or ordinary CI:
+it starts Java and a real local RelayNode, and requires the profile-scoped
+vanilla archive at `port/target/<profile>/multiplayer-smoke-server/server-artifact.bin`.
+The archive must be a regular file whose SHA-1 matches the active profile; the
+strict runner does not accept a server-archive override. Use the standalone
+compatibility command above when a different verified archive or tunable values
+are needed. In that standalone mode, `GAIUS_BROWSER_FULL_PATH_CLIENTS` (1--4)
+and `GAIUS_BROWSER_FULL_PATH_SOAK_MS` tune the run.
 `GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS` defaults to 9 (range 1--128) and gates
 every client on that many PLAY chunk packets. The JSON evidence records
 relay/login/configuration/PLAY/first-chunk timing, packet and byte rates, queue

@@ -14,7 +14,8 @@
     "smoke:profiles": "node profile-protocol-smoke.mjs",
     "smoke:public": "node public-relay-smoke.mjs",
     "smoke:browser-full-path": "node browser-full-path-smoke.mjs",
-    "smoke:browser-full-path-contract": "node browser-full-path-contract-smoke.mjs"
+    "smoke:browser-full-path-contract": "node browser-full-path-contract-smoke.mjs",
+    "smoke:browser-full-path-acceptance": "node browser-full-path-acceptance.mjs"
   },
   "dependencies": {
     "ws": "8.21.0"
