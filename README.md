@@ -220,6 +220,25 @@ active/target-total connections and CPU/RSS deltas, browser queues/leases,
 WebSockets/channels, session counters, and final all-zero cleanup. A dual-profile
 cluster acceptance run normally uses 4 clients, 9 chunks, one reconnect wave,
 and a 15-second post-reconnect soak.
+
+For a real public RelayNode and Minecraft target, run the external multi-client
+transport check with the target's actual port:
+
+```sh
+GAIUS_EXTERNAL_RELAY_URL=wss://example.com/tunnel \
+GAIUS_EXTERNAL_TARGET=relay-host.top:00000 \
+GAIUS_EXTERNAL_CLIENTS=4 \
+GAIUS_EXTERNAL_SOAK_MS=15000 \
+npm run smoke:external-multiplayer
+```
+
+This check drives the browser bridge's real WebSocket JSBody and Minecraft
+status protocol through every external tunnel. It records status RTT, target
+attestation, RelayNode active connections, browser queues, event-loop gaps, and
+zero-state cleanup. It is intentionally not LOGIN/PLAY evidence; use the
+strict full-path acceptance gate above for encrypted multiplayer, chunks,
+reconnect, and soak. `GAIUS_EXTERNAL_ENABLE_PING=1` enables an optional status
+ping probe and fails closed if the remote endpoint does not return every pong.
 The currently optional `retireClosedEntry` hook is reported as undefined and
 not invoked by this harness; the gate proves retained close evidence and final
 cleanup but does not claim to repair that product hook.
