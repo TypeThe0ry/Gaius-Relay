@@ -242,6 +242,18 @@ fails closed. It is intentionally not LOGIN/PLAY evidence; use the
 strict full-path acceptance gate above for encrypted multiplayer, chunks,
 reconnect, and soak. `GAIUS_EXTERNAL_ENABLE_PING=1` enables an optional status
 ping probe and fails closed if the remote endpoint does not return every pong.
+
+For release-grade external multiplayer evidence, run the full-path harness with
+`GAIUS_BROWSER_FULL_PATH_ACCEPTANCE=1` (or `--acceptance`). In that mode the
+external RelayNode must expose the complete runtime-gauge contract, including
+both logical/physical connection gauges (`activeTunnelLeases` and
+`activeTransportWebSockets`), and prove zero active leases, drain handles,
+synthetic ticks, and stall timers at every required lifecycle point. The logical
+lease retires when the tunnel is closed; the physical WebSocket gauge may remain
+nonzero briefly while the close handshake drains, so both are recorded rather
+than collapsed into one connection count. Compatible external runs may record
+a node that predates those gauges, but such a run is not a no-stall release
+result.
 The currently optional `retireClosedEntry` hook is reported as undefined and
 not invoked by this harness; the gate proves retained close evidence and final
 cleanup but does not claim to repair that product hook.

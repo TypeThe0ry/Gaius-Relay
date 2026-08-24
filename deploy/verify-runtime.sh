@@ -99,5 +99,36 @@ grep -Fq '"protocolVersion":1' "$tmp_dir/manifest.json" \
 grep -Fq '"target-attestation"' "$tmp_dir/manifest.json" \
     || fail "manifest does not advertise target-attestation"
 
+# A public node without the bounded runtime gauges can still complete a short
+# status probe while hiding close/lease/drain leaks.  Treat that deployment as
+# stale instead of calling it release-ready.  The logical tunnel lease and the
+# physical WebSocket count are separate gauges: the former retires at logical
+# close, while the latter may remain during the close handshake.  Parse JSON so
+# a quoted field or a partial string cannot satisfy the gate accidentally.
+if ! node - "$tmp_dir/manifest.json" <<'NODE'
+const fs = require("node:fs");
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const runtime = manifest.runtime;
+const required = [
+  "activeLocalTunnelSessions",
+  "pendingSyntheticPlayTicks",
+  "activeServerFrameDrainHandles",
+  "activeServerFrameDrainTimers",
+  "activeClientStallTimers",
+  "activeTunnelLeases",
+  "activeTransportWebSockets",
+  "rssBytes",
+  "cpuUserMicros",
+  "cpuSystemMicros",
+];
+if (!manifest.capabilities?.includes("runtime-telemetry") ||
+    !runtime || required.some((key) => !Number.isSafeInteger(runtime[key]) || runtime[key] < 0)) {
+  process.exit(1);
+}
+NODE
+then
+    fail "manifest omitted the strict multiplayer runtime contract"
+fi
+
 printf 'verify-runtime: RelayNode service=%s runtime=%s %s port=%s health=ok manifest=ok target-attestation=ok\n' \
     "$service_name" "$runtime_label" "$runtime_detail" "$expected_port"

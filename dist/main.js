@@ -78,6 +78,12 @@ function parseDnsTestInteger(value) {
 }
 
 const localTunnelSessions = new Map();
+// A RelayNode lease is the logical browser-to-target tunnel, not merely the
+// ws server's client set.  Keep the logical set explicit so a close path can
+// retire the route immediately while the underlying WebSocket close handshake
+// is still draining.  The physical client count remains exported separately
+// for leak diagnostics instead of being mistaken for an active game tunnel.
+const activeTunnelLeases = new Set();
 const targetRoutes = new Map();
 // Public target connects can arrive in one browser turn when several players
 // join the same server. Coalesce their DNS lookups and retain only filtered
@@ -487,6 +493,8 @@ function relayRuntimeSnapshot() {
         uptimeMillis: Math.max(0, Date.now() - relayStartedAt),
         activeClientStallTimers,
         activeLocalTunnelSessions: localTunnelSessions.size,
+        activeTunnelLeases: activeTunnelLeases.size,
+        activeTransportWebSockets: webSocketServer.clients.size,
         syntheticPlayTickWrites,
         syntheticPlayTickBackpressureEvents,
         syntheticPlayTickMaxWritableLength,
@@ -597,6 +605,8 @@ httpServer.on("upgrade", (request, socket, head) => {
         socket.destroy();
         return;
     }
+    // Admission still counts physical sockets: a close handshake can outlive
+    // the logical lease and must not let a burst exceed the resource cap.
     if (webSocketServer.clients.size >= config.maximumConnections) {
         socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
         socket.destroy();
@@ -607,6 +617,15 @@ httpServer.on("upgrade", (request, socket, head) => {
     });
 });
 webSocketServer.on("connection", (webSocket) => {
+    activeTunnelLeases.add(webSocket);
+    let tunnelLeaseReleased = false;
+    const releaseTunnelLease = () => {
+        if (tunnelLeaseReleased) {
+            return;
+        }
+        tunnelLeaseReleased = true;
+        activeTunnelLeases.delete(webSocket);
+    };
     let tcpSocket;
     let tunnelRequest;
     let releaseTargetRoute = () => {};
@@ -797,6 +816,7 @@ webSocketServer.on("connection", (webSocket) => {
     };
     const closeBoth = (code, reason) => {
         traceTunnelEvent(`closing tunnel code=${code} reason=${reason}`);
+        releaseTunnelLease();
         clearInterval(idleTimer);
         clearClientStallTimer();
         clearClientTcpBackpressure();
@@ -1566,6 +1586,7 @@ webSocketServer.on("connection", (webSocket) => {
             `WebSocket closed code=${code} reason=${reason.toString()} connected=${connected}`
         );
         clearInterval(idleTimer);
+        releaseTunnelLease();
         clearClientStallTimer();
         clearClientTcpBackpressure();
         tunnelCancelled = true;
@@ -2399,7 +2420,8 @@ function handleRelayNodeManifest(request, response, requestUrl) {
             return;
         }
     }
-    const activeConnections = webSocketServer.clients.size;
+    const activeConnections = activeTunnelLeases.size;
+    const transportConnections = webSocketServer.clients.size;
     const body = JSON.stringify({
         ok: true,
         kind: "gaius-relay-node",
@@ -2414,6 +2436,7 @@ function handleRelayNodeManifest(request, response, requestUrl) {
         activeConnections,
         maximumConnections: config.maximumConnections,
         availableConnections: Math.max(0, config.maximumConnections - activeConnections),
+        transportConnections,
         maximumFrameBytes: config.maximumFrameBytes,
         targetConnectTimeoutMs: config.connectTimeoutMs,
         requiresToken: config.accessToken !== undefined,
