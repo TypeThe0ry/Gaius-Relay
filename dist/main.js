@@ -1252,6 +1252,12 @@ webSocketServer.on("connection", (webSocket) => {
                             serverFrameDrainHoldingRead = false;
                             updateTcpReadState();
                         }
+                        // The accumulator is authoritative even when the drain
+                        // started without a read hold (774 can reach this path
+                        // through a fragmented TCP callback). Reconcile the
+                        // bounded diagnostic counter after every drain so a
+                        // fully consumed buffer cannot retain stale frames.
+                        updateRetainedCompleteFrameTelemetry();
                     }
                 };
                 tcpSocket.on("data", (chunk) => {
