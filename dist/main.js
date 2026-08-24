@@ -613,6 +613,12 @@ webSocketServer.on("connection", (webSocket) => {
     let connected = false;
     let tcpPausedForWebSocket = false;
     let tcpPausedForClient = false;
+    // A burst of browser -> TCP writes can report backpressure more than once
+    // before the socket emits drain. Keep exactly one listener and one pause
+    // transition per burst so high fan-in PLAY traffic cannot accumulate
+    // duplicate resume callbacks.
+    let clientTcpBackpressure = false;
+    let clientTcpDrainListener;
     // A low-water callback must not resume the TCP source until the retained
     // parser remainder has had its own guarded drain turn. This separate hold
     // keeps TCP paused while tcpPausedForWebSocket is cleared for the drain.
@@ -760,10 +766,40 @@ webSocketServer.on("connection", (webSocket) => {
         clientStallTimer.unref();
         activeClientStallTimers++;
     };
+    const clearClientTcpBackpressure = () => {
+        if (clientTcpDrainListener !== undefined && tcpSocket !== undefined) {
+            tcpSocket.off("drain", clientTcpDrainListener);
+        }
+        clientTcpDrainListener = undefined;
+        clientTcpBackpressure = false;
+    };
+    const armClientTcpBackpressure = () => {
+        if (clientTcpBackpressure || tcpSocket === undefined ||
+            tcpSocket.destroyed || webSocket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        const socket = tcpSocket;
+        clientTcpBackpressure = true;
+        webSocket.pause();
+        const listener = () => {
+            if (clientTcpDrainListener !== listener) {
+                return;
+            }
+            clientTcpDrainListener = undefined;
+            clientTcpBackpressure = false;
+            if (!tunnelCancelled && socket === tcpSocket &&
+                webSocket.readyState === WebSocket.OPEN) {
+                webSocket.resume();
+            }
+        };
+        clientTcpDrainListener = listener;
+        socket.once("drain", listener);
+    };
     const closeBoth = (code, reason) => {
         traceTunnelEvent(`closing tunnel code=${code} reason=${reason}`);
         clearInterval(idleTimer);
         clearClientStallTimer();
+        clearClientTcpBackpressure();
         tunnelCancelled = true;
         clearServerFrameState();
         tunnelConnectAbortController.abort();
@@ -1512,8 +1548,7 @@ webSocketServer.on("connection", (webSocket) => {
                     scheduleServerFrameDrain();
                 }
                 if (!tcpSocket.write(clientData)) {
-                    webSocket.pause();
-                    tcpSocket.once("drain", () => webSocket.resume());
+                    armClientTcpBackpressure();
                 }
             });
         }
@@ -1532,6 +1567,7 @@ webSocketServer.on("connection", (webSocket) => {
         );
         clearInterval(idleTimer);
         clearClientStallTimer();
+        clearClientTcpBackpressure();
         tunnelCancelled = true;
         clearServerFrameState();
         tunnelConnectAbortController.abort();
