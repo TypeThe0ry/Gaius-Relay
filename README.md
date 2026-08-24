@@ -293,10 +293,13 @@ dialogs and Code of Conduct confirmation before entering PLAY. Prompt handling
 is disabled unless the smoke process is explicitly started with
 `GAIUS_SMOKE_ACCEPT_SERVER_PROMPTS=1`. Text fields must also be supplied as a
 JSON object in `GAIUS_SMOKE_DIALOG_INPUTS_JSON`; for example, an offline server
-registration test can provide `{"password":"...","confirm":"..."}`. Use a
-disposable test account because registration changes server state. The
-production client keeps the normal visible screens and never accepts a server
-policy or submits credentials silently.
+registration test can provide `{"password":"...","confirm":"..."}`. For
+real external tests, prefer `GAIUS_SMOKE_DIALOG_INPUTS_FILE` pointing to an
+owner-readable-only JSON file with the same object, so credentials do not enter
+the process command line, environment value, or evidence logs. Use a disposable
+test account because registration changes server state. The production client
+keeps the normal visible screens and never accepts a server policy or submits
+credentials silently.
 
 ## Container deployment
 
