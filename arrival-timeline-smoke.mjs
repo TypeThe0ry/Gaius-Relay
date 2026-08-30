@@ -6,7 +6,10 @@ import assert from "node:assert/strict";
 // multiplayer runtime or any strict acceptance gate.  The model is useful for
 // the next real run because it makes the missing wire/onmessage/decode timeline
 // explicit and keeps only bounded evidence.
-const SCHEMA_VERSION = "gaius.browser-client-arrival-timeline.v1";
+// This executable is a server-free model, not the production runtime
+// payload.  Keep a distinct schema id so a consumer cannot accidentally
+// treat the model's abbreviated segment names/limits as live evidence.
+const SCHEMA_VERSION = "gaius.browser-client-arrival-timeline-model.v1";
 const SLOW_GAP_THRESHOLD_MILLIS = 250;
 const PER_CLIENT_EVENT_LIMIT = 64;
 const PER_CLIENT_SAMPLE_LIMIT = 64;
@@ -180,8 +183,16 @@ class ArrivalTimelineRecorder {
         return {
             schemaVersion: SCHEMA_VERSION,
             independentExecution: true,
+            implementation: "server-free-model",
             strictGatesChanged: false,
             slowThresholdMillis: this.slowThresholdMillis,
+            source: {
+                wireTimestampAvailable: false,
+                wireAtSource: "unavailable",
+                wireAtPolicy: "null-when-unavailable",
+                attributionPolicy:
+                    "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
+            },
             limits: {
                 perClientEvents: this.perClientEventLimit,
                 perClientSamples: this.perClientSampleLimit,
@@ -301,7 +312,10 @@ function classifyArrivalGap({ decodedGapMillis, segments, phase, reconnect, queu
         segments.onmessageToEnqueueMillis === null &&
         segments.decodeMillis === null &&
         segments.enqueueToPollMillis === null) {
-        return "upstream-silence-observed";
+        // The model has no independent wire/transport clock in this case.
+        // Missing timestamps are therefore an attribution gap, not proof of
+        // upstream silence.
+        return "unattributed-arrival-gap";
     }
     return "unknown-arrival-gap";
 }
@@ -311,8 +325,16 @@ function printConfig() {
         ok: true,
         schemaVersion: SCHEMA_VERSION,
         independentExecution: true,
+        implementation: "server-free-model",
         strictGatesChanged: false,
         slowThresholdMillis: SLOW_GAP_THRESHOLD_MILLIS,
+        source: {
+            wireTimestampAvailable: false,
+            wireAtSource: "unavailable",
+            wireAtPolicy: "null-when-unavailable",
+            attributionPolicy:
+                "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
+        },
         limits: {
             perClientEvents: PER_CLIENT_EVENT_LIMIT,
             perClientSamples: PER_CLIENT_SAMPLE_LIMIT,
@@ -329,7 +351,7 @@ function printConfig() {
             "dispatchAt",
         ],
         classifications: [
-            "upstream-silence-observed",
+            "unattributed-arrival-gap",
             "browser-delivery-delay",
             "browser-queue-delay",
             "decode-delay",
@@ -364,7 +386,7 @@ function runSelfTest() {
         decodeEndAt: 1005,
         phase: "steady-soak",
     });
-    assert.equal(silence.classification, "upstream-silence-observed");
+    assert.equal(silence.classification, "unattributed-arrival-gap");
     const browserDelay = full(2000, 3, {
         wireAt: 2000,
         onmessageAt: 2300,
