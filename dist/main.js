@@ -157,6 +157,160 @@ const serverFrameTelemetry = {
     maxDrainBytes: 0,
     maxDrainDurationMillis: 0,
 };
+// Optional, metadata-only server-frame timeline.  The normal RelayNode path
+// keeps the aggregate counters above and does not allocate timestamps or frame
+// records.  Operators can opt in explicitly for a bounded attribution window
+// with GAIUS_RELAY_FRAME_TIMELINE=1; no payload bytes, credentials, or packet
+// contents are retained.
+const relayFrameTimelineSchemaVersion = "gaius.relay.server-frame-timeline.v1";
+const relayFrameTimelineEnabled = process.env.GAIUS_RELAY_FRAME_TIMELINE === "1";
+const relayFrameTimelinePerTunnelLimit = 64;
+const relayFrameTimelineGlobalLimit = 256;
+let relayFrameTimelineNextTunnelSequence = 0;
+let relayFrameTimelineGlobalDropped = 0;
+let relayFrameTimelinePerTunnelDropped = 0;
+const relayFrameTimelineSamples = [];
+const relayFrameTimelineClock = () => ({
+    monoMillis: performance.now(),
+    epochMillis: Date.now(),
+});
+const nextRelayFrameTimelineSequence = (value) =>
+    Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, value + 1));
+const createRelayFrameTimelineState = () => {
+    if (!relayFrameTimelineEnabled) {
+        return undefined;
+    }
+    relayFrameTimelineNextTunnelSequence = nextRelayFrameTimelineSequence(
+        relayFrameTimelineNextTunnelSequence,
+    );
+    return {
+        tunnelSequence: relayFrameTimelineNextTunnelSequence,
+        nextFrameSequence: 0,
+        nextTcpDataSequence: 0,
+        drainSequence: 0,
+        pendingTcpDataAt: null,
+        pendingTcpDataSequence: 0,
+        pendingTcpDataBytes: 0,
+        samples: [],
+        dropped: 0,
+    };
+};
+const recordRelayFrameTcpData = (state, bytes, preserveExisting = false) => {
+    if (state === undefined) {
+        return;
+    }
+    if (preserveExisting && state.pendingTcpDataAt !== null) {
+        return;
+    }
+    state.nextTcpDataSequence = nextRelayFrameTimelineSequence(
+        state.nextTcpDataSequence,
+    );
+    state.pendingTcpDataSequence = state.nextTcpDataSequence;
+    state.pendingTcpDataAt = relayFrameTimelineClock();
+    state.pendingTcpDataBytes = Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : 0;
+};
+const clearRelayFrameTcpData = (state) => {
+    if (state === undefined) {
+        return;
+    }
+    state.pendingTcpDataAt = null;
+    state.pendingTcpDataSequence = 0;
+    state.pendingTcpDataBytes = 0;
+};
+const beginRelayFrameTimelineDrain = (state) => {
+    if (state === undefined) {
+        return 0;
+    }
+    state.drainSequence = nextRelayFrameTimelineSequence(state.drainSequence);
+    return state.drainSequence;
+};
+const beginRelayFrameTimelineRecord = (state, frame, context = {}) => {
+    if (state === undefined) {
+        return undefined;
+    }
+    state.nextFrameSequence = nextRelayFrameTimelineSequence(state.nextFrameSequence);
+    const forwardAttemptAt = relayFrameTimelineClock();
+    const frameReadyAt = context.frameReadyAt ?? forwardAttemptAt;
+    const frameBytes = Number.isSafeInteger(frame?.byteLength) && frame.byteLength >= 0
+        ? frame.byteLength
+        : 0;
+    const record = {
+        schemaVersion: 1,
+        tunnelSequence: state.tunnelSequence,
+        frameSequence: state.nextFrameSequence,
+        tcpDataSequence: state.pendingTcpDataSequence,
+        tcpDataBytes: state.pendingTcpDataBytes,
+        drainSequence: Number.isSafeInteger(context.drainSequence)
+            ? context.drainSequence
+            : state.drainSequence,
+        sourceKind: typeof context.sourceKind === "string"
+            ? context.sourceKind : "unknown",
+        bytes: frameBytes,
+        phase: typeof context.phase === "string" ? context.phase : "unknown",
+        tcpDataAt: state.pendingTcpDataAt === null
+            ? null : { ...state.pendingTcpDataAt },
+        frameReadyAt: { ...frameReadyAt },
+        forwardAttemptAt,
+        sendAcceptedAt: null,
+        sendCallbackAt: null,
+        bufferedAmountBefore: null,
+        bufferedAmountAfter: null,
+        pausedBefore: false,
+        pausedAfter: false,
+        result: "pending",
+    };
+    if (state.samples.length >= relayFrameTimelinePerTunnelLimit) {
+        state.samples.shift();
+        state.dropped = Math.min(Number.MAX_SAFE_INTEGER, state.dropped + 1);
+        relayFrameTimelinePerTunnelDropped = Math.min(
+            Number.MAX_SAFE_INTEGER,
+            relayFrameTimelinePerTunnelDropped + 1,
+        );
+    }
+    state.samples.push(record);
+    if (relayFrameTimelineSamples.length >= relayFrameTimelineGlobalLimit) {
+        relayFrameTimelineSamples.shift();
+        relayFrameTimelineGlobalDropped = Math.min(
+            Number.MAX_SAFE_INTEGER,
+            relayFrameTimelineGlobalDropped + 1,
+        );
+    }
+    relayFrameTimelineSamples.push(record);
+    return record;
+};
+const finishRelayFrameTimelineRecord = (record, patch) => {
+    if (record !== undefined) {
+        Object.assign(record, patch);
+    }
+};
+const relayFrameTimelineSnapshot = () => {
+    const metadata = {
+        schemaVersion: relayFrameTimelineSchemaVersion,
+        enabled: relayFrameTimelineEnabled,
+        perTunnelLimit: relayFrameTimelinePerTunnelLimit,
+        globalLimit: relayFrameTimelineGlobalLimit,
+    };
+    if (!relayFrameTimelineEnabled) {
+        return metadata;
+    }
+    return {
+        ...metadata,
+        sampleCount: relayFrameTimelineSamples.length,
+        dropped: relayFrameTimelineGlobalDropped + relayFrameTimelinePerTunnelDropped,
+        globalDropped: relayFrameTimelineGlobalDropped,
+        perTunnelDropped: relayFrameTimelinePerTunnelDropped,
+        samples: relayFrameTimelineSamples.map((sample) => ({
+            ...sample,
+            tcpDataAt: sample.tcpDataAt === null ? null : { ...sample.tcpDataAt },
+            frameReadyAt: { ...sample.frameReadyAt },
+            forwardAttemptAt: { ...sample.forwardAttemptAt },
+            sendAcceptedAt: sample.sendAcceptedAt === null
+                ? null : { ...sample.sendAcceptedAt },
+            sendCallbackAt: sample.sendCallbackAt === null
+                ? null : { ...sample.sendCallbackAt },
+        })),
+    };
+};
 const clientFrameTelemetry = {
     appendedChunks: 0,
     coalescedFrames: 0,
@@ -765,6 +919,10 @@ function relayRuntimeSnapshot() {
             sendFrames: serverFrameTelemetry.enqueuedFrames,
             sendBytes: serverFrameTelemetry.enqueuedBytes,
         },
+        // Raw frame timestamps are opt-in and bounded; the disabled shape is
+        // metadata-only so existing health consumers never receive payload or
+        // per-frame records by accident.
+        serverFrameTimeline: relayFrameTimelineSnapshot(),
         // Keep the scalar names easy to consume from existing health probes;
         // their established "sent" spelling means successfully enqueued.
         serverFramesSent: serverFrameTelemetry.enqueuedFrames,
@@ -892,6 +1050,7 @@ httpServer.on("upgrade", (request, socket, head) => {
     });
 });
 webSocketServer.on("connection", (webSocket) => {
+    const relayFrameTimelineState = createRelayFrameTimelineState();
     activeTunnelLeases.add(webSocket);
     let tunnelLeaseReleased = false;
     const releaseTunnelLease = () => {
@@ -1687,9 +1846,30 @@ webSocketServer.on("connection", (webSocket) => {
         clearServerFrameBuffer();
         tcpPausedForWebSocket = false;
         serverFrameDrainHoldingRead = false;
+        if (relayFrameTimelineEnabled) {
+            clearRelayFrameTcpData(relayFrameTimelineState);
+        }
     };
-    const forwardServerFrame = (frame) => {
+    const forwardServerFrame = (frame, timelineContext) => {
+        const timelineRecord = relayFrameTimelineEnabled
+            ? beginRelayFrameTimelineRecord(
+                relayFrameTimelineState,
+                frame,
+                {
+                    ...(timelineContext ?? {}),
+                    phase: protocolPhase,
+                    drainSequence: timelineContext?.drainSequence ??
+                        (relayFrameTimelineState?.drainSequence ?? 0),
+                },
+            )
+            : undefined;
+        if (timelineRecord !== undefined) {
+            timelineRecord.pausedBefore = tcpPausedForWebSocket;
+        }
         if (webSocket.readyState !== WebSocket.OPEN || tunnelCancelled) {
+            finishRelayFrameTimelineRecord(timelineRecord, {
+                result: serverFrameForwardResult.CLOSED,
+            });
             return serverFrameForwardResult.CLOSED;
         }
         if (tcpPausedForWebSocket) {
@@ -1697,16 +1877,29 @@ webSocketServer.on("connection", (webSocket) => {
             // normally break before reaching here; retaining the counter makes
             // regressions visible without allowing a duplicate frame to escape.
             serverFrameTelemetry.framesAfterPause++;
+            finishRelayFrameTimelineRecord(timelineRecord, {
+                result: serverFrameForwardResult.PAUSED,
+                pausedAfter: true,
+            });
             return serverFrameForwardResult.PAUSED;
         }
         const frameBytes = frame.byteLength;
-        observeWebSocketBufferedAmount();
+        const bufferedAmountBefore = observeWebSocketBufferedAmount();
+        if (timelineRecord !== undefined) {
+            timelineRecord.bufferedAmountBefore = bufferedAmountBefore;
+        }
         let sendCallbackError;
         try {
             webSocket.send(frame, { binary: true }, (error) => {
+                if (timelineRecord !== undefined) {
+                    timelineRecord.sendCallbackAt = relayFrameTimelineClock();
+                }
                 if (error) {
                     sendCallbackError = error;
                     serverFrameTelemetry.sendErrors++;
+                    finishRelayFrameTimelineRecord(timelineRecord, {
+                        result: serverFrameForwardResult.ERROR,
+                    });
                     const target = tunnelRequest === undefined
                         ? "unknown target"
                         : `${tunnelRequest.host}:${tunnelRequest.port}`;
@@ -1721,19 +1914,31 @@ webSocketServer.on("connection", (webSocket) => {
                 // a later high-water assertion into a lost drain.
                 resumeServerFrameIfLowWater();
             });
+            if (timelineRecord !== undefined) {
+                timelineRecord.sendAcceptedAt = relayFrameTimelineClock();
+            }
         }
         catch (error) {
             serverFrameTelemetry.sendErrors++;
             console.error("WebSocket send failed:", error instanceof Error ? error.message : error);
             closeBoth(1011, "WebSocket send failed");
+            finishRelayFrameTimelineRecord(timelineRecord, {
+                result: serverFrameForwardResult.ERROR,
+            });
             return serverFrameForwardResult.ERROR;
         }
         if (sendCallbackError !== undefined) {
+            finishRelayFrameTimelineRecord(timelineRecord, {
+                result: serverFrameForwardResult.ERROR,
+            });
             return serverFrameForwardResult.ERROR;
         }
         serverFrameTelemetry.enqueuedFrames++;
         serverFrameTelemetry.enqueuedBytes += frameBytes;
         const bufferedAmount = observeWebSocketBufferedAmount();
+        if (timelineRecord !== undefined) {
+            timelineRecord.bufferedAmountAfter = bufferedAmount;
+        }
         let pausedByThisSend = false;
         if (bufferedAmount >= maximumWebSocketBufferedBytes) {
             pauseTcpForWebSocket();
@@ -1742,9 +1947,14 @@ webSocketServer.on("connection", (webSocket) => {
         // This second call is intentional: ws test doubles can invoke the
         // callback synchronously before send() returns.
         resumeServerFrameIfLowWater();
-        return pausedByThisSend || tcpPausedForWebSocket
+        const result = pausedByThisSend || tcpPausedForWebSocket
             ? serverFrameForwardResult.ENQUEUED_PAUSED
             : serverFrameForwardResult.ENQUEUED;
+        finishRelayFrameTimelineRecord(timelineRecord, {
+            result,
+            pausedAfter: tcpPausedForWebSocket,
+        });
+        return result;
     };
     webSocket.on("message", () => {
         lastActivity = Date.now();
@@ -1810,6 +2020,9 @@ webSocketServer.on("connection", (webSocket) => {
                         tcpPausedForClient) {
                         return;
                     }
+                    const relayDrainSequence = relayFrameTimelineEnabled
+                        ? beginRelayFrameTimelineDrain(relayFrameTimelineState)
+                        : 0;
                     const drainStartedWithReadHold = serverFrameDrainHoldingRead;
                     const drainStartedAt = performance.now();
                     let drainFrames = 0;
@@ -1850,7 +2063,14 @@ webSocketServer.on("connection", (webSocket) => {
                                     consumeServerFrameBuffer(opaqueChunk.byteLength);
                                     continue;
                                 }
-                                const result = forwardServerFrame(opaqueChunk);
+                                const result = forwardServerFrame(opaqueChunk,
+                                    relayFrameTimelineEnabled
+                                        ? {
+                                            sourceKind: "opaque-drain",
+                                            drainSequence: relayDrainSequence,
+                                            frameReadyAt: relayFrameTimelineClock(),
+                                        }
+                                        : undefined);
                                 if (isEnqueuedServerFrameResult(result)) {
                                     // Ownership transfers to ws only after
                                     // send() accepted the bytes.
@@ -1897,7 +2117,14 @@ webSocketServer.on("connection", (webSocket) => {
                             let result;
                             serverFrameInFlightFrameBytes = parsed.frameBytes;
                             try {
-                                result = forwardServerFrame(parsed.frame);
+                                result = forwardServerFrame(parsed.frame,
+                                    relayFrameTimelineEnabled
+                                        ? {
+                                            sourceKind: "parsed-frame",
+                                            drainSequence: relayDrainSequence,
+                                            frameReadyAt: relayFrameTimelineClock(),
+                                        }
+                                        : undefined);
                             }
                             finally {
                                 serverFrameInFlightFrameBytes = 0;
@@ -2004,10 +2231,21 @@ webSocketServer.on("connection", (webSocket) => {
                         // bounded diagnostic counter after every drain so a
                         // fully consumed buffer cannot retain stale frames.
                         updateRetainedCompleteFrameTelemetry();
+                        if (relayFrameTimelineEnabled &&
+                            serverFrameBuffer.byteLength === 0) {
+                            clearRelayFrameTcpData(relayFrameTimelineState);
+                        }
                     }
                 };
                 tcpSocket.on("data", (chunk) => {
                     serverFrameTelemetry.dataCallbacks++;
+                    if (relayFrameTimelineEnabled) {
+                        recordRelayFrameTcpData(
+                            relayFrameTimelineState,
+                            chunk.byteLength,
+                            serverFrameBuffer.byteLength > 0,
+                        );
+                    }
                     // Hex previews are diagnostic-only. Building them on every PLAY chunk
                     // needlessly taxes the RelayNode even when tunnel tracing is disabled.
                     if (traceTunnel) {
@@ -2021,11 +2259,24 @@ webSocketServer.on("connection", (webSocket) => {
                         !tcpPausedForWebSocket && !tcpPausedForClient) {
                         if (clientFramePhaseWatermarkSettled() &&
                             proxyVanillaKeepAlive(tcpSocket, chunk, protocolPhase, minecraftProfile)) {
+                            if (relayFrameTimelineEnabled) {
+                                clearRelayFrameTcpData(relayFrameTimelineState);
+                            }
                             return;
                         }
                         // There is no parser remainder in the opaque path, so a
                         // successful send needs no queue bookkeeping.
-                        forwardServerFrame(chunk);
+                        forwardServerFrame(chunk,
+                            relayFrameTimelineEnabled
+                                ? {
+                                    sourceKind: "opaque-direct",
+                                    drainSequence: 0,
+                                    frameReadyAt: relayFrameTimelineClock(),
+                                }
+                                : undefined);
+                        if (relayFrameTimelineEnabled) {
+                            clearRelayFrameTcpData(relayFrameTimelineState);
+                        }
                         return;
                     }
                     appendServerFrameBuffer(chunk);
