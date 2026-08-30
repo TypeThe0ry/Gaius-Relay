@@ -14,7 +14,9 @@
     "smoke:profiles": "node profile-protocol-smoke.mjs",
     "smoke:public": "node public-relay-smoke.mjs",
     "smoke:browser-full-path": "node browser-full-path-smoke.mjs",
+    "stress:browser-full-path": "node browser-full-path-stress.mjs",
     "smoke:browser-full-path-contract": "node browser-full-path-contract-smoke.mjs",
+    "smoke:encryption-request": "node encryption-request-smoke.mjs",
     "smoke:browser-full-path-acceptance": "node browser-full-path-acceptance.mjs",
     "smoke:external-multiplayer": "node local-relay/scripts/browser-relay-external-multiplayer-smoke.mjs"
   },

@@ -179,6 +179,67 @@ acceptance JSON has `actual` and `observed` copied only from independently
 validated child acceptance sections, while `runs` contains process/timeout
 diagnostics.
 
+High-load multiplayer is a third, explicitly opt-in contract. It does **not**
+change the ordinary 2-client smoke or the strict 4/9/15,000/1 acceptance gate.
+The stress runner supports only the fixed 8- and 16-client tiers. Both use an
+8-chunk client/server view distance, a 4-chunk simulation distance, all 257
+unique positions in Minecraft's radius-8 `ChunkTrackingView`, and repeated
+full lifecycle waves. Tier 8 uses two reconnects (24 client lifecycles) and a
+60-second post-reconnect soak; tier 16 uses four reconnects (80 client
+lifecycles) and a 120-second soak. Tier 8 acknowledges chunk batches at 32
+chunks/tick; tier 16 uses 64 chunks/tick. The child hard deadlines are 20 and
+40 minutes respectively, and timeout/exit/signal/elapsed/stdout/stderr/JSON
+parse evidence is retained in the aggregate record:
+
+```sh
+npm run stress:browser-full-path -- --tier=8
+npm run stress:browser-full-path -- --tier=16
+# Sequentially run both tiers (expensive):
+npm run stress:browser-full-path -- --all
+# Validate the resolved contract without starting Java, RelayNode, or clients:
+npm run stress:browser-full-path -- --tier=16 --print-config
+```
+
+The stress entry point always selects the repository's canonical 26.2 profile
+(protocol 776/world 4903), removes inherited build/dist/profile overrides, and
+removes every external relay/target/dialog-input override. This prevents an
+8/16-client run from accidentally targeting `relay-host` or an operator's existing
+relay. A hard-deadline timeout terminates the job-owned child process tree
+(`taskkill /T /F` on Windows, a detached process group on POSIX) and records the
+cleanup attempt/error with the process evidence.
+
+Each PLAY client handles Chunk Batch Finished/Start packet IDs 11/12 and sends
+the profile-specific big-endian float32 batch acknowledgement (serverbound ID
+11 for 26.2, ID 10 for 1.21.11). Evidence keeps total and unique chunks,
+duplicates, batch/ACK counts, configured/effective radius, the exact radius
+capacity, observed bounds, and a bounded batch list. Stress evidence parses
+the real PLAY Set Chunk Cache Center/Radius and Set Simulation Distance packets
+(26.2 IDs 94/95/111; 1.21.11 IDs 92/93/109). A stress client must observe
+radius 8 and simulation distance 4 before any unique chunk counts toward the
+257-position target; the observed radius capacity must also be exactly 257.
+The runner rejects a requested unique-chunk target above the configured
+client/server radius before starting the vanilla server. Deterministic UUIDs
+remain exactly 32 hexadecimal
+digits beyond client 9, and the session fixture uses an explicit
+profile-ID-to-username map rather than decoding a one-digit suffix.
+
+Extreme latency evidence uses only fixed bucket counters (1/2/4/8/16.7/25/50/
+60/75/100/250/500/1000/+Inf ms), never an unbounded raw sample list. Each client
+reports count, p95, p99, p99.9 and max for poll gaps, PLAY tick gaps, and
+pre-target chunk packet gaps. Stress fails closed above: poll p99 16.7 ms,
+p99.9 50 ms, max 100 ms; tick p99 60 ms, p99.9 75 ms, max 100 ms; pre-target
+chunk p99 100 ms, max 250 ms.
+
+The browser transport flushes the first idle-to-active outbound write in a
+microtask, then keeps every 32-frame/256-KiB/2-ms budget continuation on a
+`MessageChannel` macrotask. Exactly one continuation callback runs per message
+task, so rendering and inbound network work retain task boundaries without
+accumulating the browser's nested zero-delay timer clamp. Timers remain only
+for real WebSocket `bufferedAmount` backpressure or as a fail-closed fallback
+when `MessageChannel` is unavailable. Strict multiplayer evidence exposes the
+schedule/callback/fallback counters and rejects any budget continuation that
+silently falls back to a clamped timer.
+
 Each profile result includes the required-versus-observed/actual soak and wave
 health, per-client online RSA/AES fail-closed evidence, canonical profile tuple,
 actual server-archive SHA-1, browser/RelayNode/target active counts, and explicit
@@ -201,6 +262,10 @@ PLAY tunnels arm the offline stall-tick interval; those timers are now created
 only after a framed connection actually enters PLAY. MSYS `/c/...` paths are
 accepted for the profile, archive, and Java environment variables. Evidence and logs remain under
 `port/target/<profile>/browser-relay-full-path-evidence/`.
+`GAIUS_BROWSER_FULL_PATH_CLIENT_VIEW_DISTANCE` (2--32, default 6) controls the
+encoded client preference; `GAIUS_BROWSER_FULL_PATH_SERVER_VIEW_DISTANCE`
+(2--32, default 2) controls the local vanilla fixture. These compatibility
+knobs do not alter either fixed release acceptance or fixed stress tiers.
 
 Set `GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES=1` (default `0`, range `0--8`)
 to add a simultaneous multiplayer reconnect gate. After every client reaches

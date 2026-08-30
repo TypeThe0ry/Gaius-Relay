@@ -25,9 +25,9 @@ an Internet-facing node.
 - verify-dnat.sh: read-only IPv4/IPv6 NAT audit that rejects an unscoped
   PREROUTING DNAT rule.
 - nginx-gaius-relay.conf: systemd TLS reverse proxy for only /tunnel,
-  /relay-node/v1, /health, and /proxy/.
-- nginx-gaius-relay-docker.conf: the same proxy locations pointing to the
-  Docker loopback port 18080.
+  /relay-node/v1, /relay-node/v1.runtime, /health, and /proxy/.
+- nginx-gaius-relay-docker.conf: the same proxy locations (including the
+  runtime telemetry endpoint) pointing to the Docker loopback port 18080.
 - verify-runtime.sh: read-only Linux audit for the listener, PID, cwd,
   running target-attestation code, health, and manifest. It supports both a
   systemd Node listener and a Docker-published listener whose docker-proxy cwd

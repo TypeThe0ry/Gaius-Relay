@@ -31,6 +31,7 @@ let dnsTestLookupAttempts = 0;
 let dnsTestSrvAttempts = 0;
 const relayNodeProtocolVersion = 1;
 const relayNodeManifestPath = "/relay-node/v1";
+const relayNodeRuntimePath = "/relay-node/v1.runtime";
 const maximumResourcePackBytes = 250 * 1024 * 1024;
 const maximumTextureBytes = 16 * 1024 * 1024;
 const maximumAuthResponseBytes = 4 * 1024 * 1024;
@@ -44,6 +45,17 @@ const maximumWebSocketBufferedBytes = 4 * 1024 * 1024;
 const maximumServerFrameDrainFrames = 32;
 const maximumServerFrameDrainBytes = 512 * 1024;
 const maximumServerFrameDrainMillis = 2;
+// Client -> TCP packets arrive through WebSocket `message` callbacks. A
+// malicious or simply bursty browser can coalesce thousands of Minecraft
+// frames into one message; parsing that entire message synchronously would
+// monopolise the RelayNode event loop and starve every other player. Keep the
+// parser's work bounded and continue the remainder on a later turn. The raw
+// WebSocket bytes are still written exactly once, in their original order;
+// this budget only bounds inspection/state accounting.
+const maximumClientFrameDrainFrames = 32;
+const maximumClientFrameDrainBytes = 512 * 1024;
+const maximumClientFrameDrainMillis = 2;
+const maximumClientFrameParserBytes = 16 * 1024 * 1024 + 5;
 // Handshakes are tiny (the host field is capped at 255 bytes), but a generic
 // TCP tunnel can arrive one WebSocket message at a time. Keep only a bounded
 // sniffing buffer and fall back to opaque forwarding once it is exceeded.
@@ -56,8 +68,13 @@ const relayCapabilities = [
     "target-affinity",
     "srv-resolution",
     "flow-control",
-    "keepalive-proxy",
-    "configuration-reentry",
+    ...(config.proxyKeepAlives
+        ? [
+            "keepalive-proxy",
+            "keepalive-proxy-v2-profiled",
+            "configuration-reentry",
+        ]
+        : []),
     "resource-pack-proxy",
     "resource-pack-cache",
     "public-target-guard",
@@ -144,6 +161,144 @@ const clientFrameTelemetry = {
     appendedChunks: 0,
     coalescedFrames: 0,
     coalescedBytes: 0,
+    drainBudgetYields: 0,
+    drainCompletions: 0,
+    maxDrainFrames: 0,
+    maxDrainBytes: 0,
+    maxDrainDurationMillis: 0,
+    bufferedBytes: 0,
+    maxBufferedBytes: 0,
+    parserHighWaterEvents: 0,
+    parserHighWaterBytes: 0,
+    // A queued client parser turn can lag the raw TCP write by one or more
+    // event-loop turns. Keep bounded scalar evidence for server rewrites that
+    // were conservatively bypassed while that phase watermark was unsettled.
+    stalePhaseBypasses: 0,
+    maxStalePhaseLagMs: 0,
+};
+// Client parser work is scheduled through one process-wide FIFO of tunnel
+// registrations.  A WebSocket can deliver many `message` callbacks in one
+// poll phase; draining synchronously from each callback would hand the same
+// tunnel a fresh budget every time and starve other players.  The scheduler
+// gives one bounded parser turn to one tunnel, then rotates it to the tail.
+const clientFrameReadyQueue = [];
+const clientFrameReadySet = new Set();
+let clientFrameSchedulerScheduled = false;
+let clientFrameSchedulerRunning = false;
+let clientFrameSchedulerHandle;
+let clientFrameSchedulerTurns = 0;
+let clientFrameSchedulerEnqueues = 0;
+let clientFrameSchedulerMaxQueueDepth = 0;
+
+function scheduleClientFrameReadyQueue() {
+    if (clientFrameSchedulerScheduled || clientFrameSchedulerRunning ||
+        clientFrameReadyQueue.length === 0) {
+        return;
+    }
+    clientFrameSchedulerScheduled = true;
+    clientFrameSchedulerHandle = setImmediate(() => {
+        clientFrameSchedulerHandle = undefined;
+        clientFrameSchedulerScheduled = false;
+        runClientFrameReadyQueue();
+    });
+}
+
+function enqueueClientFrameReady(registration) {
+    if (registration.retired || clientFrameReadySet.has(registration)) {
+        return;
+    }
+    clientFrameReadySet.add(registration);
+    clientFrameReadyQueue.push(registration);
+    clientFrameSchedulerEnqueues++;
+    clientFrameSchedulerMaxQueueDepth = Math.max(
+        clientFrameSchedulerMaxQueueDepth,
+        clientFrameReadyQueue.length,
+    );
+    scheduleClientFrameReadyQueue();
+}
+
+function removeClientFrameReady(registration) {
+    clientFrameReadySet.delete(registration);
+    const index = clientFrameReadyQueue.indexOf(registration);
+    if (index >= 0) {
+        clientFrameReadyQueue.splice(index, 1);
+    }
+    if (clientFrameReadyQueue.length === 0 && clientFrameSchedulerScheduled &&
+        clientFrameSchedulerHandle !== undefined) {
+        clearImmediate(clientFrameSchedulerHandle);
+        clientFrameSchedulerHandle = undefined;
+        clientFrameSchedulerScheduled = false;
+    }
+}
+
+function runClientFrameReadyQueue() {
+    if (clientFrameSchedulerRunning) {
+        return;
+    }
+    clientFrameSchedulerRunning = true;
+    try {
+        const registration = clientFrameReadyQueue.shift();
+        if (registration !== undefined) {
+            clientFrameReadySet.delete(registration);
+            if (!registration.retired) {
+                clientFrameSchedulerTurns++;
+                try {
+                    registration.run();
+                }
+                catch (error) {
+                    // Keep one malformed tunnel from taking down the shared
+                    // scheduler; its registration owns the close/cleanup
+                    // action and can retire itself synchronously.
+                    registration.onError?.(error);
+                }
+                if (!registration.retired) {
+                    // A registration can be retired by its run/onError path,
+                    // and a defensive hasRunnableWork implementation may
+                    // inspect parser state that changed during cleanup. Keep
+                    // one broken tunnel from escaping the process-wide
+                    // scheduler: route probe failures through the same
+                    // close/retire callback used for run failures.
+                    let hasRunnableWork = false;
+                    try {
+                        hasRunnableWork = registration.hasRunnableWork();
+                    }
+                    catch (error) {
+                        registration.onError?.(error);
+                    }
+                    if (!registration.retired && hasRunnableWork) {
+                        enqueueClientFrameReady(registration);
+                    }
+                }
+            }
+        }
+    }
+    finally {
+        clientFrameSchedulerRunning = false;
+        if (clientFrameReadyQueue.length !== 0) {
+            scheduleClientFrameReadyQueue();
+        }
+    }
+}
+
+// Keep this telemetry process-wide, scalar-only and saturating. RelayNode
+// operators need to prove which profile/phase was proxied without retaining a
+// KeepAlive value, packet bytes, encryption material, or an unbounded event log.
+const keepAliveProxyTelemetry = {
+    schemaVersion: 2,
+    enabled: config.proxyKeepAlives,
+    profilesSelected774: 0,
+    profilesSelected776: 0,
+    proxiedKeepAlives: 0,
+    proxiedKeepAlives774Configuration: 0,
+    proxiedKeepAlives774Play: 0,
+    proxiedKeepAlives776Configuration: 0,
+    proxiedKeepAlives776Play: 0,
+    lastAt: 0,
+    maxGapMillis: 0,
+    writeBackpressure: 0,
+    writeErrors: 0,
+    opaqueTransitions: 0,
+    encryptionOpaqueTransitions: 0,
 };
 const serverFrameForwardResult = Object.freeze({
     ENQUEUED: "enqueued",
@@ -264,6 +419,54 @@ function targetRouteSnapshot(request) {
     };
 }
 
+function incrementKeepAliveProxyCounter(name) {
+    keepAliveProxyTelemetry[name] = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        keepAliveProxyTelemetry[name] + 1,
+    );
+}
+
+function recordKeepAliveProfileSelection(profile) {
+    if (profile.protocolVersion === 774) {
+        incrementKeepAliveProxyCounter("profilesSelected774");
+    }
+    else if (profile.protocolVersion === 776) {
+        incrementKeepAliveProxyCounter("profilesSelected776");
+    }
+}
+
+function recordKeepAliveOpaqueTransition() {
+    incrementKeepAliveProxyCounter("opaqueTransitions");
+}
+
+function recordKeepAliveEncryptionOpaqueTransition() {
+    incrementKeepAliveProxyCounter("encryptionOpaqueTransitions");
+}
+
+function recordProxiedKeepAlive(profile, phase) {
+    const now = Date.now();
+    if (keepAliveProxyTelemetry.lastAt > 0) {
+        keepAliveProxyTelemetry.maxGapMillis = Math.max(
+            keepAliveProxyTelemetry.maxGapMillis,
+            Math.max(0, now - keepAliveProxyTelemetry.lastAt),
+        );
+    }
+    keepAliveProxyTelemetry.lastAt = now;
+    incrementKeepAliveProxyCounter("proxiedKeepAlives");
+    const groupedCounter = profile.protocolVersion === 774
+        ? phase === "configuration"
+            ? "proxiedKeepAlives774Configuration"
+            : "proxiedKeepAlives774Play"
+        : profile.protocolVersion === 776
+            ? phase === "configuration"
+                ? "proxiedKeepAlives776Configuration"
+                : "proxiedKeepAlives776Play"
+            : undefined;
+    if (groupedCounter !== undefined) {
+        incrementKeepAliveProxyCounter(groupedCounter);
+    }
+}
+
 // A zero-compression keepalive is a complete 11-byte Minecraft frame. During a
 // large browser resource reload, acknowledging it in the translator node prevents a
 // backend read timeout without delaying arbitrary game packets. The packet ids
@@ -275,29 +478,44 @@ function proxyVanillaKeepAlive(socket, frame, protocolPhase, profile) {
     }
     const packetId = frame[2];
     let responsePacketId;
+    let keepAlivePhase;
     if ((protocolPhase === "login" || protocolPhase === "configuration" ||
         protocolPhase === "reconfiguring") &&
         packetId === profile.configuration.clientboundKeepAlive) {
         // Configuration uses the common keepalive packet id in both directions.
         responsePacketId = profile.configuration.serverboundKeepAlive;
+        keepAlivePhase = "configuration";
     }
     else if (protocolPhase === "play" &&
         packetId === profile.play.clientboundKeepAlive) {
         // PLAY has different clientbound/serverbound packet registries.
         responsePacketId = profile.play.serverboundKeepAlive;
+        keepAlivePhase = "play";
     }
     else {
         return false;
     }
     const response = Buffer.from(frame);
     response[2] = responsePacketId;
-    socket.write(response);
+    let accepted;
+    try {
+        accepted = socket.write(response, (error) => {
+            if (error) {
+                incrementKeepAliveProxyCounter("writeErrors");
+            }
+        });
+    }
+    catch (error) {
+        incrementKeepAliveProxyCounter("writeErrors");
+        throw error;
+    }
+    if (!accepted) {
+        incrementKeepAliveProxyCounter("writeBackpressure");
+    }
+    recordProxiedKeepAlive(profile, keepAlivePhase);
     if (traceTunnel) {
         traceTunnelEvent(
-            `proxied ${packetId === profile.configuration.clientboundKeepAlive
-                ? "configuration"
-                : "play"} keepalive `
-                + `head=${response.toString("hex")}`
+            `proxied ${keepAlivePhase} keepalive profile=${profile.protocolVersion}`
         );
     }
     return true;
@@ -332,10 +550,31 @@ function readMinecraftFrame(buffer) {
     return null;
 }
 
-function isLoginEncryptionRequest(frame, headerBytes) {
+function isLoginEncryptionRequest(frame, headerBytes, protocolPhase, profile) {
     // Encryption begins after this login packet. Once the client answers it,
-    // bytes are opaque and must remain a direct WebSocket-to-TCP tunnel.
-    return frame.byteLength > headerBytes && frame[headerBytes] === 0x01;
+    // bytes are opaque and must remain a direct WebSocket-to-TCP tunnel. Do
+    // not classify a packet by its first payload byte alone: PLAY packet 0x01
+    // is a legal non-encryption packet, and encrypted/opaque bytes can begin
+    // with any value. The caller normally passes a frame extracted by
+    // MinecraftFrameAccumulator; re-check the outer length here as a
+    // fail-closed guard so a future caller cannot classify a partial frame.
+    if (protocolPhase !== "login" || profile === undefined ||
+        frame === undefined || frame === null ||
+        !Number.isInteger(headerBytes) || headerBytes < 1 ||
+        frame.byteLength <= headerBytes) {
+        return false;
+    }
+    const complete = readMinecraftFrame(frame);
+    if (complete === undefined || complete === null ||
+        complete.headerBytes !== headerBytes ||
+        complete.frame.byteLength !== frame.byteLength ||
+        complete.remainder.byteLength !== 0) {
+        return false;
+    }
+    const packet = minecraftPacketId(frame, headerBytes);
+    return packet !== undefined &&
+        packet.id === profile.login.clientboundEncryptionRequest &&
+        packet.packetOffset < frame.byteLength;
 }
 
 function decodeMinecraftVarInt(bytes, offset = 0) {
@@ -502,6 +741,24 @@ function relayRuntimeSnapshot() {
         maxPendingSyntheticPlayTicks,
         activeServerFrameDrainHandles,
         activeServerFrameDrainTimers: activeServerFrameDrainHandles,
+        keepAliveProxy: { ...keepAliveProxyTelemetry },
+        keepAliveProxyEnabled: keepAliveProxyTelemetry.enabled,
+        profilesSelected774: keepAliveProxyTelemetry.profilesSelected774,
+        profilesSelected776: keepAliveProxyTelemetry.profilesSelected776,
+        proxiedKeepAlives: keepAliveProxyTelemetry.proxiedKeepAlives,
+        proxiedKeepAlives774Configuration:
+            keepAliveProxyTelemetry.proxiedKeepAlives774Configuration,
+        proxiedKeepAlives774Play: keepAliveProxyTelemetry.proxiedKeepAlives774Play,
+        proxiedKeepAlives776Configuration:
+            keepAliveProxyTelemetry.proxiedKeepAlives776Configuration,
+        proxiedKeepAlives776Play: keepAliveProxyTelemetry.proxiedKeepAlives776Play,
+        proxiedKeepAliveLastAt: keepAliveProxyTelemetry.lastAt,
+        proxiedKeepAliveMaxGapMillis: keepAliveProxyTelemetry.maxGapMillis,
+        keepAliveProxyWriteBackpressure: keepAliveProxyTelemetry.writeBackpressure,
+        keepAliveProxyWriteErrors: keepAliveProxyTelemetry.writeErrors,
+        keepAliveProxyOpaqueTransitions: keepAliveProxyTelemetry.opaqueTransitions,
+        keepAliveProxyEncryptionOpaqueTransitions:
+            keepAliveProxyTelemetry.encryptionOpaqueTransitions,
         serverFrameBackpressure: {
             ...serverFrameTelemetry,
             // Compatibility aliases for the first P0 telemetry shape.
@@ -529,10 +786,28 @@ function relayRuntimeSnapshot() {
         serverFrameAppendedChunks: serverFrameTelemetry.appendedChunks,
         serverFrameCoalescedFrames: serverFrameTelemetry.coalescedFrames,
         serverFrameCoalescedBytes: serverFrameTelemetry.coalescedBytes,
-        clientFrameAppendedChunks: clientFrameTelemetry.appendedChunks,
-        clientFrameCoalescedFrames: clientFrameTelemetry.coalescedFrames,
-        clientFrameCoalescedBytes: clientFrameTelemetry.coalescedBytes,
-        publicDnsCacheEntries: publicDnsCache.size,
+         clientFrameAppendedChunks: clientFrameTelemetry.appendedChunks,
+         clientFrameCoalescedFrames: clientFrameTelemetry.coalescedFrames,
+         clientFrameCoalescedBytes: clientFrameTelemetry.coalescedBytes,
+         clientFrameDrainBudgetYields: clientFrameTelemetry.drainBudgetYields,
+         clientFrameDrainCompletions: clientFrameTelemetry.drainCompletions,
+         clientFrameMaxDrainFrames: clientFrameTelemetry.maxDrainFrames,
+         clientFrameMaxDrainBytes: clientFrameTelemetry.maxDrainBytes,
+         clientFrameMaxDrainDurationMillis: clientFrameTelemetry.maxDrainDurationMillis,
+         clientFrameBufferedBytes: clientFrameTelemetry.bufferedBytes,
+         clientFrameMaxBufferedBytes: clientFrameTelemetry.maxBufferedBytes,
+         clientFrameReadyQueueDepth: clientFrameReadyQueue.length,
+         clientFrameReadyQueueMaxDepth: clientFrameSchedulerMaxQueueDepth,
+         clientFrameSchedulerScheduled,
+         clientFrameSchedulerRunning,
+         clientFrameSchedulerTurns,
+         clientFrameSchedulerEnqueues,
+         clientFrameParserHighWaterEvents: clientFrameTelemetry.parserHighWaterEvents,
+         clientFrameParserHighWaterBytes: clientFrameTelemetry.parserHighWaterBytes,
+         clientFrameStalePhaseBypasses: clientFrameTelemetry.stalePhaseBypasses,
+         clientFrameMaxStalePhaseLagMs: clientFrameTelemetry.maxStalePhaseLagMs,
+         clientFrameMaxLagMs: clientFrameTelemetry.maxStalePhaseLagMs,
+         publicDnsCacheEntries: publicDnsCache.size,
         publicDnsCacheHits,
         publicDnsCacheMisses,
         publicDnsCacheInflightJoins,
@@ -652,12 +927,39 @@ webSocketServer.on("connection", (webSocket) => {
     let serverFrameDrainRunning = false;
     let serverFrameDrainRescheduleRequested = false;
     const clientFrameBuffer = new MinecraftFrameAccumulator(config.maximumFrameBytes);
+    let clientFrameDrainHandle;
+    let clientFrameDrainScheduled = false;
+    let clientFrameDrainRunning = false;
+    let clientFrameDrainRescheduleRequested = false;
+    let clientFrameDrainRegistration;
+    // Raw WebSocket bytes are forwarded immediately, while framed inspection is
+    // fairly scheduled. These sequence/timestamp watermarks prevent the
+    // server-side parser from rewriting a keepalive against stale client phase
+    // state when the inspection continuation has not caught up yet.
+    let clientFrameIngressSequence = 0;
+    let clientFrameCommittedSequence = 0;
+    let clientFrameLatestEnqueuedAt = 0;
+    let clientFrameStalePhaseBypasses = 0;
+    let clientFrameMaxStalePhaseLagMs = 0;
     let minecraftHandshakeBuffer = Buffer.alloc(0);
     // The first Minecraft handshake selects the packet-id table. Do not assume
     // the legacy table before that handshake: an unknown or malformed profile
     // must stay an opaque raw TCP tunnel rather than receive a guessed rewrite.
     let minecraftProfile;
     let minecraftHandshakeSeen = false;
+    let keepAliveProxyOpaque = false;
+    let keepAliveProxyEncryptionOpaque = false;
+    let clientFrameInspectionDisabled = false;
+    const transitionKeepAliveProxyToOpaque = (encryption = false) => {
+        if (!keepAliveProxyOpaque) {
+            keepAliveProxyOpaque = true;
+            recordKeepAliveOpaqueTransition();
+        }
+        if (encryption && !keepAliveProxyEncryptionOpaque) {
+            keepAliveProxyEncryptionOpaque = true;
+            recordKeepAliveEncryptionOpaqueTransition();
+        }
+    };
     const tunnelStartedAt = Date.now();
     let playStartedAt;
     let lastServerPlayPacket;
@@ -822,6 +1124,7 @@ webSocketServer.on("connection", (webSocket) => {
         clearClientTcpBackpressure();
         tunnelCancelled = true;
         clearServerFrameState();
+        clearClientFrameState();
         tunnelConnectAbortController.abort();
         releaseTargetRoute();
         tcpSocket?.destroy();
@@ -897,17 +1200,399 @@ webSocketServer.on("connection", (webSocket) => {
             serverFrameTelemetry.coalescedBytes += parsed.frameBytes;
         }
     };
+    const syncClientFrameBufferTelemetry = () => {
+        clientFrameTelemetry.bufferedBytes = clientFrameBuffer.byteLength;
+        clientFrameTelemetry.maxBufferedBytes = Math.max(
+            clientFrameTelemetry.maxBufferedBytes,
+            clientFrameTelemetry.bufferedBytes,
+        );
+    };
+    const clearClientFrameParser = () => {
+        clientFrameBuffer.clear();
+        syncClientFrameBufferTelemetry();
+    };
+    const recordClientPhaseWatermarkBypass = () => {
+        const now = performance.now();
+        const maxLagMs = clientFrameLatestEnqueuedAt > 0
+            ? Math.max(0, now - clientFrameLatestEnqueuedAt)
+            : 0;
+        clientFrameStalePhaseBypasses = Math.min(
+            Number.MAX_SAFE_INTEGER,
+            clientFrameStalePhaseBypasses + 1,
+        );
+        clientFrameMaxStalePhaseLagMs = Math.max(
+            clientFrameMaxStalePhaseLagMs,
+            maxLagMs,
+        );
+        clientFrameTelemetry.stalePhaseBypasses = Math.min(
+            Number.MAX_SAFE_INTEGER,
+            clientFrameTelemetry.stalePhaseBypasses + 1,
+        );
+        clientFrameTelemetry.maxStalePhaseLagMs = Math.max(
+            clientFrameTelemetry.maxStalePhaseLagMs,
+            maxLagMs,
+        );
+    };
+    const clientFramePhaseWatermarkSettled = () => {
+        // A raw/opaque tunnel has no profile-specific rewrite to protect. Once
+        // a profile is selected, require every appended parser sequence to be
+        // committed before synthesising a phase-dependent response.
+        if (minecraftProfile === undefined ||
+            clientFrameCommittedSequence >= clientFrameIngressSequence) {
+            return true;
+        }
+        recordClientPhaseWatermarkBypass();
+        return false;
+    };
+    const clearClientFrameState = () => {
+        if (clientFrameDrainRegistration !== undefined) {
+            clientFrameDrainRegistration.retired = true;
+            removeClientFrameReady(clientFrameDrainRegistration);
+        }
+        if (clientFrameDrainHandle !== undefined) {
+            clearImmediate(clientFrameDrainHandle);
+            clientFrameDrainHandle = undefined;
+        }
+        clientFrameDrainScheduled = false;
+        clientFrameDrainRescheduleRequested = false;
+        clientFrameInspectionDisabled = true;
+        clearClientFrameParser();
+        clientFrameIngressSequence = 0;
+        clientFrameCommittedSequence = 0;
+        clientFrameLatestEnqueuedAt = 0;
+    };
+    const disableClientFrameParsing = (encryption = false, reason =
+        "disabled keepalive proxy for opaque client traffic", preservePlayStall = false,
+        preserveProfile = false) => {
+        if (!preserveProfile) {
+            packetFramingEnabled = false;
+            minecraftProfile = undefined;
+            clientFrameInspectionDisabled = true;
+        }
+        else {
+            // High-water is an inspection fallback only. Keep the negotiated
+            // profile and server phase so keepalive/reconfiguration handling
+            // and the last observed PLAY tick remain valid while the raw TCP
+            // stream continues unchanged.
+            clientFrameInspectionDisabled = true;
+        }
+        if (encryption) {
+            encryptionResponsePending = false;
+            transitionKeepAliveProxyToOpaque(true);
+        }
+        else {
+            transitionKeepAliveProxyToOpaque();
+        }
+        clearClientFrameParser();
+        if (!preserveProfile) {
+            // Inspection is opaque after malformed/encrypted input; no
+            // outstanding parser sequence may keep the watermark stale.
+            clientFrameCommittedSequence = clientFrameIngressSequence;
+        }
+        // A parser high-water event is an inspection fallback, not a transport
+        // close.  Keep the last known PLAY tick watchdog alive so a large
+        // browser burst cannot turn into a false stall; encryption/malformed
+        // transitions continue to clear it through the default path.
+        if (!preservePlayStall) {
+            clearClientStallTimer();
+        }
+        traceTunnelEvent(reason);
+    };
     const appendClientFrameBuffer = (chunk) => {
+        if (chunk === undefined || chunk.byteLength === 0) {
+            return;
+        }
+        clientFrameIngressSequence = Math.min(
+            Number.MAX_SAFE_INTEGER,
+            clientFrameIngressSequence + 1,
+        );
+        clientFrameLatestEnqueuedAt = performance.now();
+        const nextBytes = clientFrameBuffer.byteLength + chunk.byteLength;
+        if (nextBytes > maximumClientFrameParserBytes) {
+            clientFrameTelemetry.parserHighWaterEvents++;
+            clientFrameTelemetry.parserHighWaterBytes = Math.max(
+                clientFrameTelemetry.parserHighWaterBytes,
+                nextBytes,
+            );
+            disableClientFrameParsing(false,
+                "disabled keepalive proxy after client parser high-water", true, true);
+            return;
+        }
         const beforeChunks = clientFrameBuffer.appendedChunks;
         clientFrameBuffer.append(chunk);
         clientFrameTelemetry.appendedChunks +=
             clientFrameBuffer.appendedChunks - beforeChunks;
+        syncClientFrameBufferTelemetry();
+    };
+    const isStandaloneClientControlFrame = (chunk) => {
+        if (!clientFrameInspectionDisabled || !packetFramingEnabled ||
+            minecraftProfile === undefined || chunk.byteLength === 0) {
+            return false;
+        }
+        // After a parser high-water fallback the previous accumulator may have
+        // ended mid-frame. Only recover on a self-contained, payloadless
+        // protocol-control frame; arbitrary chunks must stay opaque rather than
+        // restarting VarInt parsing at an unknown boundary.
+        const parsed = readMinecraftFrame(chunk);
+        if (parsed === undefined || parsed === null ||
+            parsed.remainder.byteLength !== 0) {
+            return false;
+        }
+        if (protocolPhase === "login") {
+            return isPayloadlessPacket(
+                parsed.frame,
+                parsed.headerBytes,
+                minecraftProfile.login.serverboundLoginAcknowledged,
+            );
+        }
+        if (protocolPhase === "configuration") {
+            return isPayloadlessPacket(
+                parsed.frame,
+                parsed.headerBytes,
+                minecraftProfile.configuration.serverboundFinish,
+            );
+        }
+        if (protocolPhase === "play" || protocolPhase === "reconfiguring") {
+            return isPayloadlessPacket(
+                parsed.frame,
+                parsed.headerBytes,
+                minecraftProfile.play.serverboundConfigurationAcknowledged,
+            ) || isPayloadlessPacket(
+                parsed.frame,
+                parsed.headerBytes,
+                minecraftProfile.play.serverboundClientTickEnd,
+            );
+        }
+        return false;
+    };
+    const recoverStandaloneClientControlFrame = (chunk) => {
+        if (!isStandaloneClientControlFrame(chunk)) {
+            return false;
+        }
+        clientFrameInspectionDisabled = false;
+        return true;
     };
     const observeClientFrameCoalescing = (parsed) => {
         if (parsed?.coalesced === true) {
             clientFrameTelemetry.coalescedFrames++;
             clientFrameTelemetry.coalescedBytes += parsed.frameBytes;
         }
+    };
+    const processClientFrame = (parsed) => {
+        // Commit parser ownership before publishing phase transitions or
+        // packet observations. The raw bytes are forwarded separately below,
+        // exactly once, so yielding here cannot duplicate or reorder TCP data.
+        clientFrameBuffer.consume(parsed.frameBytes);
+        syncClientFrameBufferTelemetry();
+        observeClientFrameCoalescing(parsed);
+        if (protocolPhase === "login" && minecraftProfile !== undefined &&
+            isPayloadlessPacket(
+                parsed.frame,
+                parsed.headerBytes,
+                minecraftProfile.login.serverboundLoginAcknowledged,
+            )) {
+            protocolPhase = "configuration";
+            traceTunnelEvent("login acknowledged; entered CONFIGURATION");
+        }
+        else if (protocolPhase === "configuration" && minecraftProfile !== undefined &&
+            isPayloadlessPacket(
+                parsed.frame,
+                parsed.headerBytes,
+                minecraftProfile.configuration.serverboundFinish,
+            )) {
+            configurationCycles++;
+            protocolPhase = "play";
+            // Match the compression framing already used by the
+            // configuration ACK while selecting the profile's tick id.
+            playTickFrame = createPayloadlessMinecraftFrame(
+                minecraftProfile.play.serverboundClientTickEnd,
+                parsed.frame[parsed.headerBytes] === 0x00,
+            );
+            lastClientTrafficAt = Date.now();
+            if (playStartedAt === undefined) {
+                playStartedAt = Date.now();
+                traceTunnelEvent("armed synthetic play tick for initial spawn");
+            }
+            else {
+                traceTunnelEvent(
+                    `re-entered PLAY after configuration cycle ${configurationCycles}`,
+                );
+            }
+            armClientStallTimer();
+        }
+        else if ((protocolPhase === "play" || protocolPhase === "reconfiguring") &&
+            minecraftProfile !== undefined &&
+            isPayloadlessPacket(
+                parsed.frame,
+                parsed.headerBytes,
+                minecraftProfile.play.serverboundConfigurationAcknowledged,
+            )) {
+            protocolPhase = "configuration";
+            lastClientTrafficAt = Date.now();
+            clearClientStallTimer();
+            traceTunnelEvent("client acknowledged PLAY to CONFIGURATION transition");
+        }
+        if (traceTunnel && protocolPhase === "play" && minecraftProfile !== undefined) {
+            const packet = minecraftPacketId(parsed.frame, parsed.headerBytes);
+            if (packet !== undefined) {
+                lastClientPlayPacket = `0x${packet.id.toString(16)}/${parsed.frame.byteLength}`;
+            }
+        }
+        // Tick observation is functional state, not a tracing side effect.
+        // Keep it armed even when GAIUS_TRACE_TUNNEL is disabled; otherwise a
+        // busy browser can stop refreshing the synthetic PLAY-tick watchdog.
+        if (protocolPhase === "play" && minecraftProfile !== undefined &&
+            isPayloadlessPacket(
+                parsed.frame,
+                parsed.headerBytes,
+                minecraftProfile.play.serverboundClientTickEnd,
+            )) {
+            playTickFrame = Buffer.from(parsed.frame);
+            traceTunnelEvent("observed play tick for stall proxy");
+        }
+        // Retain an exact trace guard for the static contract, but keep the
+        // profile check nested so a malformed/opaque tunnel cannot reach the
+        // profile-specific payload decoder.
+        if (traceTunnel && protocolPhase === "play") {
+            if (minecraftProfile !== undefined) {
+                traceCustomPayload(
+                    parsed.frame,
+                    parsed.headerBytes,
+                    "client",
+                    true,
+                    minecraftProfile,
+                );
+            }
+        }
+    };
+    const drainClientFrameBuffer = () => {
+        if (clientFrameDrainRunning || tunnelCancelled || !connected ||
+            tcpSocket === undefined || tcpSocket.destroyed ||
+            !packetFramingEnabled || clientFrameInspectionDisabled ||
+            clientFrameBuffer.byteLength === 0) {
+            return;
+        }
+        // The first client packet after an encryption request is opaque. Do
+        // this before looking at any retained bytes; encrypted data must never
+        // be guessed as a VarInt-framed packet.
+        if (encryptionResponsePending) {
+            disableClientFrameParsing(true,
+                "disabled keepalive proxy after login encryption response");
+            return;
+        }
+        const startedAt = performance.now();
+        let drainFrames = 0;
+        let drainBytes = 0;
+        let drainBudgetYielded = false;
+        clientFrameDrainRunning = true;
+        try {
+            while (packetFramingEnabled && clientFrameBuffer.byteLength > 0 &&
+                !tunnelCancelled) {
+                if (drainFrames > 0 &&
+                    (drainFrames >= maximumClientFrameDrainFrames ||
+                        drainBytes >= maximumClientFrameDrainBytes ||
+                        performance.now() - startedAt >= maximumClientFrameDrainMillis)) {
+                    drainBudgetYielded = true;
+                    clientFrameTelemetry.drainBudgetYields++;
+                    break;
+                }
+                const parsed = clientFrameBuffer.peekFrame();
+                if (parsed === undefined) {
+                    break;
+                }
+                if (parsed === null) {
+                    disableClientFrameParsing(false,
+                        "disabled keepalive proxy for opaque client traffic");
+                    break;
+                }
+                processClientFrame(parsed);
+                drainFrames++;
+                drainBytes += parsed.frameBytes;
+                if (encryptionResponsePending) {
+                    disableClientFrameParsing(true,
+                        "disabled keepalive proxy after login encryption response");
+                    break;
+                }
+            }
+        }
+        catch (error) {
+            // Parser failures must fail closed to opaque forwarding while the
+            // original raw WebSocket bytes continue through the TCP path.
+            disableClientFrameParsing(false,
+                `disabled keepalive proxy after client parser error: ${
+                    error instanceof Error ? error.message : String(error)}`);
+        }
+        finally {
+            clientFrameDrainRunning = false;
+            clientFrameTelemetry.drainCompletions++;
+            clientFrameTelemetry.maxDrainFrames = Math.max(
+                clientFrameTelemetry.maxDrainFrames,
+                drainFrames,
+            );
+            clientFrameTelemetry.maxDrainBytes = Math.max(
+                clientFrameTelemetry.maxDrainBytes,
+                drainBytes,
+            );
+            clientFrameTelemetry.maxDrainDurationMillis = Math.max(
+                clientFrameTelemetry.maxDrainDurationMillis,
+                performance.now() - startedAt,
+            );
+            syncClientFrameBufferTelemetry();
+            if (packetFramingEnabled && !clientFrameInspectionDisabled &&
+                clientFrameBuffer.byteLength === 0) {
+                // Every framed remainder appended so far has been consumed;
+                // publish the sequence watermark only at this ownership
+                // boundary, never while a partial frame remains.
+                clientFrameCommittedSequence = clientFrameIngressSequence;
+            }
+            const rescheduleRequested = clientFrameDrainRescheduleRequested ||
+                drainBudgetYielded;
+            clientFrameDrainRescheduleRequested = false;
+            if (rescheduleRequested && packetFramingEnabled &&
+                clientFrameBuffer.byteLength > 0 && !tunnelCancelled) {
+                scheduleClientFrameDrain();
+            }
+        }
+    };
+    const scheduleClientFrameDrain = () => {
+        if (clientFrameDrainRunning) {
+            clientFrameDrainRescheduleRequested = true;
+            return;
+        }
+        if (clientFrameDrainScheduled || tunnelCancelled || !connected ||
+            tcpSocket === undefined || tcpSocket.destroyed ||
+            !packetFramingEnabled || clientFrameInspectionDisabled ||
+            clientFrameBuffer.byteLength === 0 ||
+            clientFrameDrainRegistration === undefined) {
+            return;
+        }
+        clientFrameDrainScheduled = true;
+        enqueueClientFrameReady(clientFrameDrainRegistration);
+    };
+    clientFrameDrainRegistration = {
+        retired: false,
+        run: () => {
+            clientFrameDrainScheduled = false;
+            clientFrameDrainHandle = undefined;
+            drainClientFrameBuffer();
+        },
+        hasRunnableWork: () => {
+            if (tunnelCancelled || !connected || !packetFramingEnabled ||
+                clientFrameInspectionDisabled || clientFrameBuffer.byteLength === 0) {
+                return false;
+            }
+            const parsed = clientFrameBuffer.peekFrame();
+            return parsed !== undefined;
+        },
+        onError: (error) => {
+            if (!tunnelCancelled) {
+                traceTunnelEvent(
+                    `client frame scheduler failure: ${error instanceof Error
+                        ? error.message : String(error)}`,
+                );
+                closeBoth(1011, "Client frame scheduler failed");
+            }
+        },
     };
     const observeWebSocketBufferedAmount = () => {
         const bufferedAmount = Number(webSocket.bufferedAmount);
@@ -1155,7 +1840,8 @@ webSocketServer.on("connection", (webSocket) => {
                                 if (opaqueChunk === undefined) {
                                     break;
                                 }
-                                if (proxyVanillaKeepAlive(
+                                if (clientFramePhaseWatermarkSettled() &&
+                                    proxyVanillaKeepAlive(
                                     tcpSocket,
                                     opaqueChunk,
                                     protocolPhase,
@@ -1189,15 +1875,14 @@ webSocketServer.on("connection", (webSocket) => {
                                 // This is normally encrypted online-mode traffic.
                                 // Keep the opaque bytes in order and send them as
                                 // one frame once the current high-water pause clears.
-                                packetFramingEnabled = false;
-                                minecraftProfile = undefined;
-                                clearClientStallTimer();
-                                traceTunnelEvent("disabled keepalive proxy for opaque server traffic");
+                                disableClientFrameParsing(false,
+                                    "disabled keepalive proxy for opaque server traffic");
                                 // Keep the accumulator intact and let the next
                                 // loop iteration forward its original chunks.
                                 continue;
                             }
-                            if (proxyVanillaKeepAlive(
+                            if (clientFramePhaseWatermarkSettled() &&
+                                proxyVanillaKeepAlive(
                                 tcpSocket,
                                 parsed.frame,
                                 protocolPhase,
@@ -1241,7 +1926,12 @@ webSocketServer.on("connection", (webSocket) => {
                                     clearClientStallTimer();
                                     traceTunnelEvent("server started PLAY to CONFIGURATION transition");
                                 }
-                                if (isLoginEncryptionRequest(parsed.frame, parsed.headerBytes)) {
+                                if (isLoginEncryptionRequest(
+                                    parsed.frame,
+                                    parsed.headerBytes,
+                                    protocolPhase,
+                                    minecraftProfile,
+                                )) {
                                     encryptionResponsePending = true;
                                 }
                                 traceCustomPayload(
@@ -1329,7 +2019,8 @@ webSocketServer.on("connection", (webSocket) => {
                     lastActivity = Date.now();
                     if (!packetFramingEnabled && serverFrameBuffer.byteLength === 0 &&
                         !tcpPausedForWebSocket && !tcpPausedForClient) {
-                        if (proxyVanillaKeepAlive(tcpSocket, chunk, protocolPhase, minecraftProfile)) {
+                        if (clientFramePhaseWatermarkSettled() &&
+                            proxyVanillaKeepAlive(tcpSocket, chunk, protocolPhase, minecraftProfile)) {
                             return;
                         }
                         // There is no parser remainder in the opaque path, so a
@@ -1427,6 +2118,7 @@ webSocketServer.on("connection", (webSocket) => {
                             // be promoted into a 774/776 profile handshake.
                             minecraftHandshakeSeen = true;
                             minecraftHandshakeBuffer = Buffer.alloc(0);
+                            transitionKeepAliveProxyToOpaque();
                         }
                     }
                     else if (handshakeResult.state === "complete") {
@@ -1438,6 +2130,7 @@ webSocketServer.on("connection", (webSocket) => {
                             // Unsupported versions remain a raw tunnel. A later
                             // supported-looking packet must never reopen framing.
                             minecraftProfile = undefined;
+                            transitionKeepAliveProxyToOpaque();
                             frameClientData = undefined;
                             traceTunnelEvent(
                                 `disabled profile-aware rewrites for unsupported Minecraft protocol `
@@ -1446,7 +2139,9 @@ webSocketServer.on("connection", (webSocket) => {
                         }
                         else {
                             minecraftProfile = handshake.profile;
+                            recordKeepAliveProfileSelection(minecraftProfile);
                             packetFramingEnabled = true;
+                            clientFrameInspectionDisabled = false;
                             traceTunnelEvent(
                                 `enabled framed keepalive proxy for Minecraft ${minecraftProfile.name}`
                             );
@@ -1456,6 +2151,7 @@ webSocketServer.on("connection", (webSocket) => {
                         minecraftHandshakeSeen = true;
                         minecraftHandshakeBuffer = Buffer.alloc(0);
                         minecraftProfile = undefined;
+                        transitionKeepAliveProxyToOpaque();
                         frameClientData = undefined;
                         traceTunnelEvent(
                             "disabled profile-aware rewrites for opaque or malformed Minecraft traffic"
@@ -1466,109 +2162,45 @@ webSocketServer.on("connection", (webSocket) => {
                     // Handshake probing supplies only the post-handshake
                     // remainder so the raw handshake is never inspected twice.
                     // Appending keeps each WebSocket chunk owned by the deque.
-                    appendClientFrameBuffer(frameClientData);
-                    while (clientFrameBuffer.byteLength > 0) {
-                        const parsed = clientFrameBuffer.peekFrame();
-                        if (parsed === undefined) {
-                            break;
-                        }
-                        if (parsed === null) {
-                            packetFramingEnabled = false;
-                            minecraftProfile = undefined;
-                            clientFrameBuffer.clear();
-                            clearClientStallTimer();
-                            traceTunnelEvent("disabled keepalive proxy for opaque client traffic");
-                            break;
-                        }
-                        // Commit parser ownership before publishing any state
-                        // transition or packet observation.
-                        clientFrameBuffer.consume(parsed.frameBytes);
-                        observeClientFrameCoalescing(parsed);
-                        if (protocolPhase === "login" &&
-                            isPayloadlessPacket(
-                                parsed.frame,
-                                parsed.headerBytes,
-                                minecraftProfile.login.serverboundLoginAcknowledged
-                            )) {
-                            protocolPhase = "configuration";
-                            traceTunnelEvent("login acknowledged; entered CONFIGURATION");
-                        }
-                        else if (protocolPhase === "configuration" &&
-                            isPayloadlessPacket(
-                                parsed.frame,
-                                parsed.headerBytes,
-                                minecraftProfile.configuration.serverboundFinish
-                            )) {
-                            configurationCycles++;
-                            protocolPhase = "play";
-                            // Match the compression framing already used by the
-                            // configuration ACK while selecting the profile's tick id.
-                            playTickFrame = createPayloadlessMinecraftFrame(
-                                minecraftProfile.play.serverboundClientTickEnd,
-                                parsed.frame[parsed.headerBytes] === 0x00
-                            );
-                            lastClientTrafficAt = Date.now();
-                            if (playStartedAt === undefined) {
-                                playStartedAt = Date.now();
-                                traceTunnelEvent("armed synthetic play tick for initial spawn");
-                            }
-                            else {
-                                traceTunnelEvent(
-                                    `re-entered PLAY after configuration cycle ${configurationCycles}`
-                                );
-                            }
-                            armClientStallTimer();
-                        }
-                        else if ((protocolPhase === "play" ||
-                            protocolPhase === "reconfiguring") &&
-                            isPayloadlessPacket(
-                                parsed.frame,
-                                parsed.headerBytes,
-                                minecraftProfile.play.serverboundConfigurationAcknowledged
-                            )) {
-                            protocolPhase = "configuration";
-                            lastClientTrafficAt = Date.now();
-                            clearClientStallTimer();
-                            traceTunnelEvent("client acknowledged PLAY to CONFIGURATION transition");
-                        }
-                        if (traceTunnel && protocolPhase === "play") {
-                            const packet = minecraftPacketId(parsed.frame, parsed.headerBytes);
-                            if (packet !== undefined) {
-                                lastClientPlayPacket = `0x${packet.id.toString(16)}/${parsed.frame.byteLength}`;
-                            }
-                        }
-                        if (protocolPhase === "play" &&
-                            isPayloadlessPacket(
-                                parsed.frame,
-                                parsed.headerBytes,
-                                minecraftProfile.play.serverboundClientTickEnd
-                            )) {
-                            playTickFrame = Buffer.from(parsed.frame);
-                            traceTunnelEvent("observed play tick for stall proxy");
-                        }
-                        traceCustomPayload(
-                            parsed.frame,
-                            parsed.headerBytes,
-                            "client",
-                            protocolPhase === "play",
-                            minecraftProfile
-                        );
+                    recoverStandaloneClientControlFrame(frameClientData);
+                    if (!clientFrameInspectionDisabled) {
+                        appendClientFrameBuffer(frameClientData);
                     }
+                    // Never drain synchronously from the WebSocket callback.
+                    // All tunnels share the process-wide ready queue, so a
+                    // burst of separate messages cannot refresh this tunnel's
+                    // budget and starve another player in the same poll turn.
+                    scheduleClientFrameDrain();
                 }
                 if (encryptionResponsePending) {
-                    packetFramingEnabled = false;
-                    minecraftProfile = undefined;
-                    encryptionResponsePending = false;
-                    clientFrameBuffer.clear();
-                    clearClientStallTimer();
-                    traceTunnelEvent("disabled keepalive proxy after login encryption response");
+                    disableClientFrameParsing(true,
+                        "disabled keepalive proxy after login encryption response");
                     // Keep any complete/partial server bytes retained by a
                     // high-water pause. They are now opaque encrypted bytes,
                     // not disposable parser state, and must drain in order.
                     scheduleServerFrameDrain();
                 }
-                if (!tcpSocket.write(clientData)) {
-                    armClientTcpBackpressure();
+                // The TCP peer can close between the parser continuation and
+                // this raw, exactly-once write.  Treat that race as a tunnel
+                // close rather than allowing ERR_STREAM_DESTROYED to escape
+                // the WebSocket message callback (which would otherwise be
+                // reported as an invalid control message).
+                if (tcpSocket === undefined || tcpSocket.destroyed ||
+                    tcpSocket.writable === false) {
+                    closeBoth(1011, "TCP connection closed during client frame");
+                    return;
+                }
+                try {
+                    if (!tcpSocket.write(clientData)) {
+                        armClientTcpBackpressure();
+                    }
+                }
+                catch (error) {
+                    traceTunnelEvent(
+                        `client TCP write failed: ${error instanceof Error
+                            ? error.message : String(error)}`,
+                    );
+                    closeBoth(1011, "TCP client frame write failed");
                 }
             });
         }
@@ -1591,6 +2223,7 @@ webSocketServer.on("connection", (webSocket) => {
         clearClientTcpBackpressure();
         tunnelCancelled = true;
         clearServerFrameState();
+        clearClientFrameState();
         tunnelConnectAbortController.abort();
         releaseTargetRoute();
         tcpSocket?.destroy();
@@ -2172,7 +2805,9 @@ function toBuffer(data) {
 }
 async function handleHttpRequest(request, response) {
     const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
-    if (requestUrl.pathname === "/health" || requestUrl.pathname === relayNodeManifestPath) {
+    if (requestUrl.pathname === "/health" ||
+        requestUrl.pathname === relayNodeManifestPath ||
+        requestUrl.pathname === relayNodeRuntimePath) {
         handleRelayNodeManifest(request, response, requestUrl);
         return;
     }
