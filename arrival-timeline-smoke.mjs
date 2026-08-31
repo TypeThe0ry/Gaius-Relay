@@ -143,13 +143,49 @@ class ArrivalTimelineRecorder {
             : null;
         const segments = this.#segments(timestamps);
         const reconnect = this.#reconnectSummary(clientId, wave);
-        const triggerSegments = Object.entries(segments)
-            .filter(([, value]) => Number.isFinite(value) &&
-                value >= this.slowThresholdMillis)
-            .map(([name]) => name);
-        const slow = (decodedGapMillis !== null &&
-            decodedGapMillis >= this.slowThresholdMillis) ||
-            triggerSegments.length > 0;
+        let triggerMask = 0;
+        let slowTriggerMillis = decodedGapMillis ?? 0;
+        const threshold = this.slowThresholdMillis;
+        if (Number.isFinite(segments.wireToOnmessageMillis) &&
+            segments.wireToOnmessageMillis >= threshold) {
+            triggerMask |= 1;
+            slowTriggerMillis = Math.max(slowTriggerMillis, segments.wireToOnmessageMillis);
+        }
+        if (Number.isFinite(segments.onmessageToEnqueueMillis) &&
+            segments.onmessageToEnqueueMillis >= threshold) {
+            triggerMask |= 2;
+            slowTriggerMillis = Math.max(slowTriggerMillis, segments.onmessageToEnqueueMillis);
+        }
+        if (Number.isFinite(segments.enqueueToPollMillis) &&
+            segments.enqueueToPollMillis >= threshold) {
+            triggerMask |= 4;
+            slowTriggerMillis = Math.max(slowTriggerMillis, segments.enqueueToPollMillis);
+        }
+        if (Number.isFinite(segments.pollToDecodeMillis) &&
+            segments.pollToDecodeMillis >= threshold) {
+            triggerMask |= 8;
+            slowTriggerMillis = Math.max(slowTriggerMillis, segments.pollToDecodeMillis);
+        }
+        if (Number.isFinite(segments.decodeMillis) &&
+            segments.decodeMillis >= threshold) {
+            triggerMask |= 16;
+            slowTriggerMillis = Math.max(slowTriggerMillis, segments.decodeMillis);
+        }
+        if (Number.isFinite(segments.decodeToDispatchMillis) &&
+            segments.decodeToDispatchMillis >= threshold) {
+            triggerMask |= 32;
+            slowTriggerMillis = Math.max(slowTriggerMillis, segments.decodeToDispatchMillis);
+        }
+        const slow = slowTriggerMillis >= threshold;
+        const triggerSegments = slow ? [] : null;
+        if (triggerSegments !== null) {
+            if (triggerMask & 1) triggerSegments.push("wireToOnmessageMillis");
+            if (triggerMask & 2) triggerSegments.push("onmessageToEnqueueMillis");
+            if (triggerMask & 4) triggerSegments.push("enqueueToPollMillis");
+            if (triggerMask & 8) triggerSegments.push("pollToDecodeMillis");
+            if (triggerMask & 16) triggerSegments.push("decodeMillis");
+            if (triggerMask & 32) triggerSegments.push("decodeToDispatchMillis");
+        }
         let classification;
         if (slow) {
             classification = classifyArrivalGap({
@@ -167,11 +203,7 @@ class ArrivalTimelineRecorder {
                 frameSeq,
                 phase,
                 decodedGapMillis,
-                slowTriggerMillis: Math.max(
-                    decodedGapMillis ?? 0,
-                    ...Object.values(segments).map((value) =>
-                        Number.isFinite(value) ? value : 0),
-                ),
+                slowTriggerMillis,
                 thresholdMillis: this.slowThresholdMillis,
                 segments,
                 triggerSegments,
@@ -184,11 +216,7 @@ class ArrivalTimelineRecorder {
         return {
             ...packet,
             decodedGapMillis,
-            slowTriggerMillis: slow ? Math.max(
-                decodedGapMillis ?? 0,
-                ...Object.values(segments).map((value) =>
-                    Number.isFinite(value) ? value : 0),
-            ) : null,
+            slowTriggerMillis: slow ? slowTriggerMillis : null,
             triggerSegments,
             segments,
             reconnect,
@@ -556,6 +584,8 @@ function runSelfTest() {
         decodeStartAt: 13, decodeEndAt: 14, dispatchAt: 15,
     });
     assert.equal(fast.classification, undefined);
+    assert.equal(fast.triggerSegments, null);
+    assert.equal(fast.slowTriggerMillis, null);
     assert.equal(fastRecorder.snapshot().slowSampleCountTotal, 0);
     assert.equal(fastRecorder.snapshot().slowSamples.length, 0);
     return { ...result, overflow };
