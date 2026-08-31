@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node dist/main.js",
     "start:registry": "node dist/registry.js",
-    "smoke": "node framed-stream-smoke.mjs && node client-tcp-bounded-drain-smoke.mjs && node server-packet-processor-isolation-smoke.mjs && node multiplayer-smoke.mjs && node registry-smoke.mjs && node local-relay/scripts/browser-relay-routing-smoke.mjs && node browser-full-path-contract-smoke.mjs",
+    "smoke": "node framed-stream-smoke.mjs && node client-tcp-bounded-drain-smoke.mjs && node server-packet-processor-isolation-smoke.mjs && node multiplayer-smoke.mjs && node registry-smoke.mjs && node local-relay/scripts/browser-relay-routing-smoke.mjs && node local-relay/scripts/browser-inbound-backpressure-smoke.mjs && node local-relay/scripts/browser-outbound-backpressure-smoke.mjs && node local-relay/scripts/browser-global-pump-fairness-smoke.mjs && node browser-full-path-contract-smoke.mjs",
     "smoke:profiles": "node profile-protocol-smoke.mjs",
     "smoke:public": "node public-relay-smoke.mjs",
     "smoke:browser-full-path": "node browser-full-path-smoke.mjs",
