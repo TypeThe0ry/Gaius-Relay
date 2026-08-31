@@ -143,8 +143,13 @@ class ArrivalTimelineRecorder {
             : null;
         const segments = this.#segments(timestamps);
         const reconnect = this.#reconnectSummary(clientId, wave);
-        const slow = decodedGapMillis !== null &&
-            decodedGapMillis >= this.slowThresholdMillis;
+        const triggerSegments = Object.entries(segments)
+            .filter(([, value]) => Number.isFinite(value) &&
+                value >= this.slowThresholdMillis)
+            .map(([name]) => name);
+        const slow = (decodedGapMillis !== null &&
+            decodedGapMillis >= this.slowThresholdMillis) ||
+            triggerSegments.length > 0;
         let classification;
         if (slow) {
             classification = classifyArrivalGap({
@@ -162,15 +167,33 @@ class ArrivalTimelineRecorder {
                 frameSeq,
                 phase,
                 decodedGapMillis,
+                slowTriggerMillis: Math.max(
+                    decodedGapMillis ?? 0,
+                    ...Object.values(segments).map((value) =>
+                        Number.isFinite(value) ? value : 0),
+                ),
                 thresholdMillis: this.slowThresholdMillis,
                 segments,
+                triggerSegments,
                 queueDepth,
                 reconnect,
                 classification,
             };
             this.#retainSample(sample);
         }
-        return { ...packet, decodedGapMillis, segments, reconnect, classification };
+        return {
+            ...packet,
+            decodedGapMillis,
+            slowTriggerMillis: slow ? Math.max(
+                decodedGapMillis ?? 0,
+                ...Object.values(segments).map((value) =>
+                    Number.isFinite(value) ? value : 0),
+            ) : null,
+            triggerSegments,
+            segments,
+            reconnect,
+            classification,
+        };
     }
 
     snapshot() {
@@ -278,7 +301,8 @@ class ArrivalTimelineRecorder {
 }
 
 function compareSamples(left, right) {
-    return right.decodedGapMillis - left.decodedGapMillis ||
+    return (right.slowTriggerMillis ?? right.decodedGapMillis) -
+        (left.slowTriggerMillis ?? left.decodedGapMillis) ||
         left.sampleSequence - right.sampleSequence;
 }
 
@@ -418,6 +442,32 @@ function runSelfTest() {
         queueDepth: 3,
     });
     assert.equal(dispatchDelay.classification, "dispatch-queue-delay");
+    const segmentTriggerRecorder = new ArrivalTimelineRecorder();
+    segmentTriggerRecorder.recordPacket({
+        clientId: "segment",
+        frameSeq: 0,
+        decodeEndAt: 800,
+    });
+    const segmentTriggered = segmentTriggerRecorder.recordPacket({
+        clientId: "segment",
+        frameSeq: 1,
+        onmessageAt: 200,
+        bridgeEnqueueAt: 201,
+        pollAt: 501,
+        decodeStartAt: 502,
+        decodeEndAt: 503,
+        dispatchAt: 504,
+    });
+    assert.equal(segmentTriggered.decodedGapMillis, 0,
+        "decoded gap should remain observable for segment trigger coverage");
+    assert.ok(segmentTriggered.decodedGapMillis < SLOW_GAP_THRESHOLD_MILLIS,
+        "segment trigger case must keep aggregate decoded gap below threshold");
+    // A local segment is independently sufficient to materialize a sample;
+    // use a small decoded gap so this does not regress to the aggregate-only
+    // trigger that previously hid queue/decode stalls.
+    assert.ok(segmentTriggered.classification,
+        "segment trigger must materialize a diagnostic sample");
+    assert.ok(segmentTriggered.triggerSegments.includes("enqueueToPollMillis"));
     for (const [phase, at] of [
         ["disconnect", 5000],
         ["reconnect-scheduled", 5001],
@@ -474,6 +524,40 @@ function runSelfTest() {
     assert.equal(overflow.limits.globalSamples, 8);
     assert.equal(overflow.slowSamples.length, 8);
     assert.ok(overflow.slowSamplesDropped > 0);
+    const exactOverflowRecorder = new ArrivalTimelineRecorder({
+        perClientSampleLimit: 64,
+        globalSampleLimit: 256,
+    });
+    exactOverflowRecorder.recordPacket({
+        clientId: "exact-overflow", frameSeq: 0, decodeEndAt: 0,
+    });
+    for (let i = 1; i <= 65; i++) {
+        exactOverflowRecorder.recordPacket({
+            clientId: "exact-overflow",
+            frameSeq: i,
+            decodeEndAt: i * 300,
+        });
+    }
+    const exactOverflow = exactOverflowRecorder.snapshot();
+    assert.equal(exactOverflow.slowSampleCountTotal, 65);
+    assert.equal(exactOverflow.slowSamplesDropped, 1);
+    assert.equal(exactOverflow.slowSamples.length, 65);
+    assert.equal(exactOverflow.clientRings[0].samples, 64);
+    assert.equal(exactOverflow.clientRings[0].events, 64);
+    assert.equal(exactOverflow.slowSamples[0].slowTriggerMillis, 300);
+    assert.equal(exactOverflow.slowSamples.at(-1).slowTriggerMillis, 300);
+    const fastRecorder = new ArrivalTimelineRecorder();
+    fastRecorder.recordPacket({
+        clientId: "fast", frameSeq: 0, decodeEndAt: 0,
+    });
+    const fast = fastRecorder.recordPacket({
+        clientId: "fast", frameSeq: 1,
+        onmessageAt: 10, bridgeEnqueueAt: 11, pollAt: 12,
+        decodeStartAt: 13, decodeEndAt: 14, dispatchAt: 15,
+    });
+    assert.equal(fast.classification, undefined);
+    assert.equal(fastRecorder.snapshot().slowSampleCountTotal, 0);
+    assert.equal(fastRecorder.snapshot().slowSamples.length, 0);
     return { ...result, overflow };
 }
 
