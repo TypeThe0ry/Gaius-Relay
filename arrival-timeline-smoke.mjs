@@ -15,6 +15,45 @@ const PER_CLIENT_EVENT_LIMIT = 64;
 const PER_CLIENT_SAMPLE_LIMIT = 64;
 const GLOBAL_SAMPLE_LIMIT = 256;
 const RECONNECT_TIMELINE_LIMIT = 32;
+const TRACE_SCHEMA_VERSION = "gaius.browser-client-arrival-trace.v1";
+const TRACE_EVENT_LIMIT = 64;
+const TRACE_POLL_EVENT_STRIDE = 256;
+const TRACE_FRAME_EVENT_STRIDE = 8;
+const TRACE_PACKET_BEGIN_EVENT_STRIDE = 16;
+const TRACE_PACKET_END_EVENT_STRIDE = 4;
+const TRACE_RING_KEY_LIMIT = 256;
+const TRACE_EVENT_KINDS = Object.freeze([
+    "onmessage-enter",
+    "bridge-enqueue",
+    "bridge-dequeue",
+    "poll-ready",
+    "poll-begin",
+    "poll-end",
+    "decode-begin",
+    "decode-end",
+    "dispatch-begin",
+    "dispatch-end",
+    "phase",
+    "client-created",
+    "handshake-sent",
+    "disconnect",
+    "reconnect-scheduled",
+    "synthetic-transport-drop",
+    "connect-begin",
+    "transport-open",
+    "login-begin",
+    "login-done",
+    "configuration-begin",
+    "configuration-done",
+    "play-enter",
+    "play-login",
+    "first-onmessage",
+    "first-decoded-packet",
+    "first-chunk",
+    "minimum-chunks",
+    "close",
+]);
+const TRACE_EVENT_KIND_SET = new Set(TRACE_EVENT_KINDS);
 
 const RECONNECT_PHASES = Object.freeze([
     "disconnect",
@@ -29,6 +68,161 @@ const RECONNECT_PHASES = Object.freeze([
     "first-onmessage",
     "first-decoded-packet",
 ]);
+
+function createTraceRing() {
+    return {
+        limit: TRACE_EVENT_LIMIT,
+        nextIndex: 0,
+        sequence: 0,
+        dropped: 0,
+        events: new Array(TRACE_EVENT_LIMIT),
+    };
+}
+
+function traceInteger(value) {
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function traceNumber(value) {
+    return Number.isFinite(value) && value >= 0 ? Number(value) : null;
+}
+
+function appendTraceEvent(ring, {
+    kind,
+    at,
+    source = "client",
+    frameSequence = null,
+    frameBytes = null,
+    packetSequence = null,
+    packetId = null,
+    phase = null,
+    schedulerCallbackSequence = null,
+    pollSequence = null,
+    queueDepth = null,
+    bufferedBytes = null,
+    durationMillis = null,
+    intentional = false,
+}) {
+    assert(ring !== undefined && ring !== null, "trace ring is required");
+    assert(TRACE_EVENT_KIND_SET.has(kind), `unknown trace event kind: ${kind}`);
+    const sequence = ++ring.sequence;
+    const index = ring.nextIndex;
+    if (ring.events[index] !== undefined) ring.dropped++;
+    const event = {
+        schemaVersion: TRACE_SCHEMA_VERSION,
+        sequence,
+        kind,
+        at: traceNumber(at),
+        source: source === "socket" ? "socket" : "client",
+        frameSequence: traceInteger(frameSequence),
+        frameBytes: traceInteger(frameBytes),
+        packetSequence: traceInteger(packetSequence),
+        packetId: traceInteger(packetId),
+        phase: phase === null || phase === undefined ? null : String(phase),
+        schedulerCallbackSequence: traceInteger(schedulerCallbackSequence),
+        pollSequence: traceInteger(pollSequence),
+        queueDepth: traceInteger(queueDepth),
+        bufferedBytes: traceInteger(bufferedBytes),
+        durationMillis: traceNumber(durationMillis),
+        intentional: intentional === true,
+    };
+    ring.events[index] = event;
+    ring.nextIndex = (index + 1) % ring.limit;
+    return event;
+}
+
+function orderedTraceEvents(ring) {
+    if (ring === undefined || ring === null) return [];
+    return ring.events.filter((event) => event !== undefined)
+        .sort((left, right) => left.sequence - right.sequence);
+}
+
+function traceWindowFromRing(ring, startAt, endAt) {
+    const start = Number.isFinite(startAt) ? Number(startAt) : null;
+    const end = Number.isFinite(endAt) ? Number(endAt) : null;
+    const bounded = start !== null || end !== null;
+    const ringAvailable = ring !== undefined && ring !== null;
+    let ringOverflowAffectsWindow = false;
+    const retainedEvents = orderedTraceEvents(ring);
+    const timestampUnavailable = retainedEvents.filter((event) =>
+        event.at === null).length;
+    const retainedTimes = retainedEvents.map((event) => event.at)
+        .filter((at) => Number.isFinite(at));
+    const ringDropped = ring?.dropped ?? 0;
+    if (ringDropped > 0 && (start === null || retainedTimes.length === 0 ||
+        Math.min(...retainedTimes) > start)) {
+        ringOverflowAffectsWindow = true;
+    }
+    const events = retainedEvents.filter((event) =>
+        (() => {
+            if (bounded && event.at === null) {
+                return false;
+            }
+            return (start === null || event.at >= start) &&
+                (end === null || event.at <= end);
+        })())
+        .sort((left, right) =>
+            (left.at ?? Number.POSITIVE_INFINITY) -
+                (right.at ?? Number.POSITIVE_INFINITY) ||
+            left.sequence - right.sequence || left.source.localeCompare(right.source));
+    const retained = events.slice(0, TRACE_EVENT_LIMIT);
+    const overflow = Math.max(0, events.length - retained.length);
+    const times = retained.map((event) => event.at)
+        .filter((at) => Number.isFinite(at));
+    let maxInterEventGapMillis = 0;
+    for (let index = 1; index < times.length; index++) {
+        maxInterEventGapMillis = Math.max(
+            maxInterEventGapMillis, Math.max(0, times[index] - times[index - 1]));
+    }
+    const eventCounts = Object.fromEntries(
+        TRACE_EVENT_KINDS.map((eventKind) => [eventKind, 0]));
+    for (const event of retained) eventCounts[event.kind]++;
+    const dropped = ringDropped + overflow;
+    return {
+        schemaVersion: TRACE_SCHEMA_VERSION,
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        limit: TRACE_EVENT_LIMIT,
+        gapStartAt: start,
+        gapEndAt: end,
+        gapMillis: start !== null && end !== null ? Math.max(0, end - start) : null,
+        firstEventAt: times.length > 0 ? times[0] : null,
+        lastEventAt: times.length > 0 ? times[times.length - 1] : null,
+        maxInterEventGapMillis,
+        eventCounts,
+        events: retained,
+        dropped,
+        ringDropped,
+        ringOverflowAffectsWindow,
+        timestampUnavailableEvents: timestampUnavailable,
+        coverage: !ringAvailable ? "unavailable" : timestampUnavailable > 0
+            ? "timestamp-incomplete" : (ringOverflowAffectsWindow || overflow > 0)
+                ? "ring-overflow" : "complete",
+        wireAtSource: "unavailable",
+        bridgeEnqueueTimestampAvailable: false,
+    };
+}
+
+function traceContract() {
+    return {
+        schemaVersion: TRACE_SCHEMA_VERSION,
+        enabled: true,
+        strictEvidenceEligible: false,
+        independentExecution: true,
+        eventLimit: TRACE_EVENT_LIMIT,
+        pollEventStride: TRACE_POLL_EVENT_STRIDE,
+        frameEventStride: TRACE_FRAME_EVENT_STRIDE,
+        packetBeginEventStride: TRACE_PACKET_BEGIN_EVENT_STRIDE,
+        packetEndEventStride: TRACE_PACKET_END_EVENT_STRIDE,
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        wireAtSource: "unavailable",
+        bridgeEnqueueTimestampAvailable: false,
+        retention: "bounded-gap-window",
+        sampling: "producer-sampled-before-record",
+        ringKeyLimit: TRACE_RING_KEY_LIMIT,
+    };
+}
 
 class ArrivalTimelineRecorder {
     constructor({
@@ -49,6 +243,8 @@ class ArrivalTimelineRecorder {
         this.globalSampleLimit = globalSampleLimit;
         this.reconnectTimelineLimit = reconnectTimelineLimit;
         this.eventsByClient = new Map();
+        this.traceByClient = new Map();
+        this.traceRingsDropped = 0;
         this.samplesByClient = new Map();
         this.samples = [];
         this.reconnectByClient = new Map();
@@ -71,6 +267,7 @@ class ArrivalTimelineRecorder {
         if (timeline.length >= this.reconnectTimelineLimit) timeline.shift();
         timeline.push({ phase, at });
         this.reconnectByClient.set(key, timeline);
+        this.recordTraceEvent({ clientId, wave, kind: phase, at, phase });
     }
 
     recordPacket({
@@ -87,6 +284,7 @@ class ArrivalTimelineRecorder {
         dispatchAt = null,
         queueDepth = null,
         intentionalDrop = false,
+        traceEvents = [],
     }) {
         this.#validateIdentity(clientId, wave);
         assert(Number.isSafeInteger(frameSeq) && frameSeq >= 0,
@@ -127,6 +325,14 @@ class ArrivalTimelineRecorder {
         if (events.length >= this.perClientEventLimit) events.shift();
         events.push(packet);
         this.eventsByClient.set(clientKey, events);
+        assert(Array.isArray(traceEvents), "traceEvents must be an array");
+        for (const event of traceEvents) {
+            this.recordTraceEvent({
+                ...event,
+                clientId,
+                wave,
+            });
+        }
 
         if (packet.intentionalDrop) {
             this.intentionalDropCount++;
@@ -207,6 +413,8 @@ class ArrivalTimelineRecorder {
                 thresholdMillis: this.slowThresholdMillis,
                 segments,
                 triggerSegments,
+                traceWindow: this.traceWindow(
+                    clientId, wave, previousDecodeEnd, decodeEndAt),
                 queueDepth,
                 reconnect,
                 classification,
@@ -222,6 +430,28 @@ class ArrivalTimelineRecorder {
             reconnect,
             classification,
         };
+    }
+
+    recordTraceEvent({ clientId, wave = 0, ...event }) {
+        this.#validateIdentity(clientId, wave);
+        assert(event !== null && typeof event === "object",
+            "trace event must be an object");
+        const key = this.#key(clientId, wave);
+        if (!this.traceByClient.has(key) && this.traceByClient.size >= TRACE_RING_KEY_LIMIT) {
+            const oldestKey = this.traceByClient.keys().next().value;
+            this.traceByClient.delete(oldestKey);
+            this.traceRingsDropped++;
+        }
+        const ring = this.traceByClient.get(key) ?? createTraceRing();
+        const recorded = appendTraceEvent(ring, event);
+        this.traceByClient.set(key, ring);
+        return recorded;
+    }
+
+    traceWindow(clientId, wave = 0, startAt = null, endAt = null) {
+        this.#validateIdentity(clientId, wave);
+        return traceWindowFromRing(
+            this.traceByClient.get(this.#key(clientId, wave)), startAt, endAt);
     }
 
     snapshot() {
@@ -244,16 +474,38 @@ class ArrivalTimelineRecorder {
                 attributionPolicy:
                     "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
             },
+            trace: traceContract(),
             limits: {
                 perClientEvents: this.perClientEventLimit,
                 perClientSamples: this.perClientSampleLimit,
                 globalSamples: this.globalSampleLimit,
                 reconnectTimelineEntries: this.reconnectTimelineLimit,
+                traceEvents: TRACE_EVENT_LIMIT,
+                traceRingKeys: TRACE_RING_KEY_LIMIT,
             },
             slowSampleCountTotal: this.slowSampleCountTotal,
             slowSamplesDropped: this.slowSamplesDropped,
             intentionalDropCount: this.intentionalDropCount,
-            slowSamples: [...this.samples],
+            slowSamples: this.samples.map((sample) => ({
+                ...sample,
+                segments: { ...sample.segments },
+                triggerSegments: sample.triggerSegments === null
+                    ? null : [...sample.triggerSegments],
+                traceWindow: sample.traceWindow === undefined ? null : {
+                    ...sample.traceWindow,
+                    eventCounts: { ...sample.traceWindow.eventCounts },
+                    events: sample.traceWindow.events.map((event) => ({ ...event })),
+                },
+                reconnect: { ...sample.reconnect },
+            })),
+            traceRings: [...this.traceByClient.entries()].map(([key, ring]) => ({
+                key,
+                schemaVersion: TRACE_SCHEMA_VERSION,
+                limit: TRACE_EVENT_LIMIT,
+                retainedEvents: orderedTraceEvents(ring).length,
+                dropped: ring.dropped,
+            })),
+            traceRingsDropped: this.traceRingsDropped,
             clientRings: [...this.clientIds].sort().map((clientId) => ({
                 clientId,
                 events: (this.eventsByClient.get(clientId) ?? []).length,
@@ -387,11 +639,14 @@ function printConfig() {
             attributionPolicy:
                 "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
         },
+        trace: traceContract(),
         limits: {
             perClientEvents: PER_CLIENT_EVENT_LIMIT,
             perClientSamples: PER_CLIENT_SAMPLE_LIMIT,
             globalSamples: GLOBAL_SAMPLE_LIMIT,
             reconnectTimelineEntries: RECONNECT_TIMELINE_LIMIT,
+            traceEvents: TRACE_EVENT_LIMIT,
+            traceRingKeys: TRACE_RING_KEY_LIMIT,
         },
         timestampFields: [
             "wireAt",
@@ -439,6 +694,166 @@ function runSelfTest() {
         phase: "steady-soak",
     });
     assert.equal(silence.classification, "unattributed-arrival-gap");
+    const noEventTraceRecorder = new ArrivalTimelineRecorder();
+    noEventTraceRecorder.recordPacket({
+        clientId: "trace-gap",
+        frameSeq: 0,
+        decodeEndAt: 0,
+    });
+    noEventTraceRecorder.recordPacket({
+        clientId: "trace-gap",
+        frameSeq: 1,
+        phase: "steady-soak",
+        decodeEndAt: 1065,
+    });
+    const noEventTraceSample = noEventTraceRecorder.snapshot().slowSamples[0];
+    assert.equal(noEventTraceSample.classification, "unattributed-arrival-gap");
+    assert.equal(noEventTraceSample.traceWindow.gapMillis, 1065);
+    assert.equal(noEventTraceSample.traceWindow.events.length, 0);
+    assert.equal(noEventTraceSample.traceWindow.coverage, "unavailable");
+    assert.equal(noEventTraceSample.traceWindow.wireAtSource, "unavailable");
+    assert.equal(noEventTraceSample.traceWindow.bridgeEnqueueTimestampAvailable, false);
+
+    const traceRecorder = new ArrivalTimelineRecorder();
+    traceRecorder.recordPacket({
+        clientId: "trace",
+        frameSeq: 0,
+        decodeEndAt: 0,
+    });
+    traceRecorder.recordPacket({
+        clientId: "trace",
+        frameSeq: 1,
+        phase: "steady-soak",
+        decodeEndAt: 1065,
+        traceEvents: [
+            { kind: "onmessage-enter", at: 100, source: "socket", frameSequence: 1,
+                frameBytes: 12 },
+            { kind: "bridge-dequeue", at: 400, source: "socket", frameSequence: 1,
+                frameBytes: 12, bufferedBytes: 12 },
+            { kind: "decode-begin", at: 401, frameSequence: 1 },
+            { kind: "decode-end", at: 402, frameSequence: 1, packetSequence: 7,
+                packetId: 39 },
+            { kind: "dispatch-begin", at: 402, packetSequence: 7, packetId: 39 },
+            { kind: "dispatch-end", at: 403, packetSequence: 7, packetId: 39,
+                durationMillis: 1 },
+        ],
+    });
+    const traceSample = traceRecorder.snapshot().slowSamples[0];
+    assert.equal(traceSample.traceWindow.schemaVersion, TRACE_SCHEMA_VERSION);
+    assert.equal(traceSample.traceWindow.gapMillis, 1065);
+    assert.equal(traceSample.traceWindow.events.length, 6);
+    assert.equal(traceSample.traceWindow.eventCounts["onmessage-enter"], 1);
+    assert.equal(traceSample.traceWindow.eventCounts["dispatch-end"], 1);
+    assert.equal(traceSample.traceWindow.events[0].source, "socket");
+    assert.equal(traceSample.traceWindow.events.at(-1).durationMillis, 1);
+    assert.equal(traceSample.traceWindow.wireAtSource, "unavailable");
+    assert.equal(traceSample.traceWindow.bridgeEnqueueTimestampAvailable, false);
+    traceRecorder.recordTraceEvent({
+        clientId: "trace",
+        wave: 0,
+        kind: "phase",
+        at: null,
+    });
+    const nullTimestampTrace = traceRecorder.traceWindow("trace", 0, null, null);
+    assert.equal(nullTimestampTrace.timestampUnavailableEvents, 1);
+    assert.equal(nullTimestampTrace.coverage, "timestamp-incomplete");
+    assert.equal(nullTimestampTrace.events.length, 7);
+    assert.deepEqual(traceRecorder.snapshot().trace, traceContract());
+    assert.equal(traceRecorder.snapshot().limits.traceRingKeys, TRACE_RING_KEY_LIMIT);
+    const identityRecorder = new ArrivalTimelineRecorder();
+    identityRecorder.recordPacket({
+        clientId: "owner",
+        wave: 2,
+        frameSeq: 0,
+        decodeEndAt: 0,
+        traceEvents: [{
+            clientId: "spoofed",
+            wave: 99,
+            kind: "decode-end",
+            at: 1,
+        }],
+    });
+    const identityRings = identityRecorder.snapshot().traceRings;
+    assert.deepEqual(identityRings.map(({ key }) => key), ["owner@wave-2"]);
+    const keyOverflowRecorder = new ArrivalTimelineRecorder();
+    for (let index = 0; index < TRACE_RING_KEY_LIMIT + 1; index++) {
+        keyOverflowRecorder.recordTraceEvent({
+            clientId: `key-${index}`,
+            kind: "phase",
+            at: index,
+        });
+    }
+    const keyOverflowSnapshot = keyOverflowRecorder.snapshot();
+    assert.equal(keyOverflowSnapshot.traceRings.length, TRACE_RING_KEY_LIMIT);
+    assert.equal(keyOverflowSnapshot.traceRingsDropped, 1);
+    assert.equal(keyOverflowSnapshot.traceRings[0].key, "key-1@wave-0");
+    const evictedWindow = keyOverflowRecorder.traceWindow("key-0");
+    assert.equal(evictedWindow.coverage, "unavailable");
+    assert.throws(() => traceRecorder.recordTraceEvent({
+        clientId: "trace",
+        kind: "raw-wire-payload",
+        at: 500,
+    }), /unknown trace event kind/);
+    assert.deepEqual(
+        Object.keys(traceSample.traceWindow.events[0]).sort(),
+        [
+            "at",
+            "bufferedBytes",
+            "durationMillis",
+            "frameBytes",
+            "frameSequence",
+            "intentional",
+            "kind",
+            "packetId",
+            "packetSequence",
+            "phase",
+            "pollSequence",
+            "queueDepth",
+            "schedulerCallbackSequence",
+            "schemaVersion",
+            "source",
+            "sequence",
+        ].sort(),
+    );
+
+    const outOfOrderTraceRecorder = new ArrivalTimelineRecorder();
+    outOfOrderTraceRecorder.recordTraceEvent({
+        clientId: "ordered",
+        kind: "decode-end",
+        at: 20,
+    });
+    outOfOrderTraceRecorder.recordTraceEvent({
+        clientId: "ordered",
+        kind: "decode-begin",
+        at: 10,
+    });
+    const orderedTrace = outOfOrderTraceRecorder.traceWindow("ordered", 0, 0, 20);
+    assert.deepEqual(orderedTrace.events.map(({ at }) => at), [10, 20]);
+    assert.equal(orderedTrace.maxInterEventGapMillis, 10);
+
+    const traceOverflowRecorder = new ArrivalTimelineRecorder();
+    for (let index = 0; index < TRACE_EVENT_LIMIT + 1; index++) {
+        traceOverflowRecorder.recordTraceEvent({
+            clientId: "trace-overflow",
+            kind: "decode-end",
+            at: index,
+            packetSequence: index,
+        });
+    }
+    const traceOverflow = traceOverflowRecorder.traceWindow(
+        "trace-overflow", 0, 0, TRACE_EVENT_LIMIT);
+    assert.equal(traceOverflow.events.length, TRACE_EVENT_LIMIT);
+    assert.equal(traceOverflow.dropped, 1);
+    assert.equal(traceOverflow.ringDropped, 1);
+    assert.equal(traceOverflow.coverage, "ring-overflow");
+    assert.equal(traceOverflow.events[0].at, 1);
+    assert.equal(traceOverflow.events.at(-1).at, TRACE_EVENT_LIMIT);
+
+    const traceContractSnapshot = traceRecorder.snapshot();
+    assert.deepEqual(traceContractSnapshot.trace, traceContract());
+    assert.equal(traceContractSnapshot.limits.traceEvents, TRACE_EVENT_LIMIT);
+    assert.equal(traceContractSnapshot.traceRings[0].retainedEvents, 7);
+    assert.equal(traceContractSnapshot.traceRings[0].dropped, 0);
     const browserDelay = full(2000, 3, {
         wireAt: 2000,
         onmessageAt: 2300,
