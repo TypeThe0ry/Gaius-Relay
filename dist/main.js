@@ -131,6 +131,10 @@ const serverFrameTelemetry = {
     enqueuedFrames: 0,
     enqueuedBytes: 0,
     sendErrors: 0,
+    // An asynchronous ws send callback can report an error after the tunnel
+    // has already entered teardown. Keep that race visible separately so
+    // serverFrameSendErrors remains a strict active/open-send invariant.
+    sendErrorsAfterClose: 0,
     cleanupBytes: 0,
     bufferedUnderflows: 0,
     bufferedUnderflowBytes: 0,
@@ -156,6 +160,12 @@ const serverFrameTelemetry = {
     maxDrainFrames: 0,
     maxDrainBytes: 0,
     maxDrainDurationMillis: 0,
+};
+const incrementServerFrameSendErrorsAfterClose = () => {
+    serverFrameTelemetry.sendErrorsAfterClose = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        serverFrameTelemetry.sendErrorsAfterClose + 1,
+    );
 };
 // Optional, metadata-only server-frame timeline.  The normal RelayNode path
 // keeps the aggregate counters above and does not allocate timestamps or frame
@@ -257,6 +267,7 @@ const beginRelayFrameTimelineRecord = (state, frame, context = {}) => {
         bufferedAmountAfter: null,
         pausedBefore: false,
         pausedAfter: false,
+        sendErrorAfterClose: false,
         result: "pending",
     };
     if (state.samples.length >= relayFrameTimelinePerTunnelLimit) {
@@ -930,6 +941,7 @@ function relayRuntimeSnapshot() {
         serverFrameEnqueuedFrames: serverFrameTelemetry.enqueuedFrames,
         serverFrameEnqueuedBytes: serverFrameTelemetry.enqueuedBytes,
         serverFrameSendErrors: serverFrameTelemetry.sendErrors,
+        serverFrameSendErrorsAfterClose: serverFrameTelemetry.sendErrorsAfterClose,
         serverFrameCleanupBytes: serverFrameTelemetry.cleanupBytes,
         serverFrameBufferedUnderflows: serverFrameTelemetry.bufferedUnderflows,
         serverFrameBufferedUnderflowBytes: serverFrameTelemetry.bufferedUnderflowBytes,
@@ -1896,16 +1908,28 @@ webSocketServer.on("connection", (webSocket) => {
                 }
                 if (error) {
                     sendCallbackError = error;
-                    serverFrameTelemetry.sendErrors++;
+                    const sendErrorAfterClose = tunnelCancelled ||
+                        webSocket.readyState !== WebSocket.OPEN;
+                    // ws may complete the callback after closeBoth/close;
+                    // retain the error without turning teardown into a
+                    // live-send failure or re-entering closeBoth.
+                    if (sendErrorAfterClose) {
+                        incrementServerFrameSendErrorsAfterClose();
+                    }
+                    else {
+                        serverFrameTelemetry.sendErrors++;
+                    }
                     finishRelayFrameTimelineRecord(timelineRecord, {
                         result: serverFrameForwardResult.ERROR,
+                        sendErrorAfterClose,
                     });
                     const target = tunnelRequest === undefined
                         ? "unknown target"
                         : `${tunnelRequest.host}:${tunnelRequest.port}`;
                     console.error(`WebSocket send error for ${target}:`, error.message);
                 }
-                if (error && webSocket.readyState === WebSocket.OPEN) {
+                if (error && !tunnelCancelled &&
+                    webSocket.readyState === WebSocket.OPEN) {
                     closeBoth(1011, "WebSocket send failed");
                     return;
                 }
@@ -1919,12 +1943,25 @@ webSocketServer.on("connection", (webSocket) => {
             }
         }
         catch (error) {
-            serverFrameTelemetry.sendErrors++;
+            const sendErrorAfterClose = tunnelCancelled ||
+                webSocket.readyState !== WebSocket.OPEN;
+            // A synchronous throw can race the close path too.  It is still
+            // logged and represented in telemetry; only the active/open case
+            // below trips the strict failure path.
+            if (sendErrorAfterClose) {
+                incrementServerFrameSendErrorsAfterClose();
+            }
+            else {
+                serverFrameTelemetry.sendErrors++;
+            }
             console.error("WebSocket send failed:", error instanceof Error ? error.message : error);
-            closeBoth(1011, "WebSocket send failed");
             finishRelayFrameTimelineRecord(timelineRecord, {
                 result: serverFrameForwardResult.ERROR,
+                sendErrorAfterClose,
             });
+            if (!sendErrorAfterClose) {
+                closeBoth(1011, "WebSocket send failed");
+            }
             return serverFrameForwardResult.ERROR;
         }
         if (sendCallbackError !== undefined) {

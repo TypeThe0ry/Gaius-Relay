@@ -77,6 +77,30 @@ assert.match(relayMainSource,
 assert.match(relayMainSource,
     /timelineRecord\.sendAcceptedAt = relayFrameTimelineClock\(\)/u,
     "send acceptance timestamp is missing");
+assert.match(relayMainSource,
+    /sendErrorsAfterClose:\s*0/u,
+    "after-close send-error counter is missing or unbounded");
+assert.match(relayMainSource,
+    /const incrementServerFrameSendErrorsAfterClose = \(\) => \{[\s\S]*?Math\.min\([\s\S]*?Number\.MAX_SAFE_INTEGER[\s\S]*?sendErrorsAfterClose \+ 1/u,
+    "after-close send-error counter must remain a bounded scalar");
+assert.match(relayMainSource,
+    /serverFrameSendErrorsAfterClose:\s*serverFrameTelemetry\.sendErrorsAfterClose/u,
+    "after-close send-error counter is not exposed as a scalar");
+assert.match(relayMainSource,
+    /const sendErrorAfterClose = tunnelCancelled \|\|\s+webSocket\.readyState !== WebSocket\.OPEN/u,
+    "send callback does not classify tunnel teardown state");
+assert.match(relayMainSource,
+    /if \(sendErrorAfterClose\) \{\s+incrementServerFrameSendErrorsAfterClose\(\);/u,
+    "closed send callback errors must enter the after-close counter");
+assert.match(relayMainSource,
+    /else \{\s+serverFrameTelemetry\.sendErrors\+\+;/u,
+    "active/open send callback errors must remain strict errors");
+assert.match(relayMainSource,
+    /if \(error && !tunnelCancelled &&\s+webSocket\.readyState === WebSocket\.OPEN\) \{\s+closeBoth/u,
+    "active/open send errors must still close the failed tunnel");
+assert.match(relayMainSource,
+    /sendErrorAfterClose:\s*false/u,
+    "timeline records must carry the send-error classification field");
 
 const snapshotStart = relayMainSource.indexOf(
     "const relayFrameTimelineSnapshot = () =>");
@@ -183,6 +207,7 @@ function makeTimeline(enabled = true) {
                 sendCallbackAt: {monoMillis: frameSequence + 0.4, epochMillis: 1_700_000_000_000 + frameSequence},
                 bufferedAmountBefore: 0,
                 bufferedAmountAfter: 128,
+                sendErrorAfterClose: false,
                 result: "enqueued",
             };
             if (current.samples.length >= PER_TUNNEL_LIMIT) {
@@ -200,6 +225,64 @@ function makeTimeline(enabled = true) {
         stateByTunnel,
     };
 }
+
+// The strict counter is deliberately a classification boundary, not an error
+// suppression mechanism: an error while the socket is OPEN still increments
+// sendErrors, while a callback that arrives after cancellation/close is kept in
+// the separate bounded diagnostic scalar.  Both records remain observable.
+function makeSendErrorLedger() {
+    const ledger = {
+        sendErrors: 0,
+        sendErrorsAfterClose: 0,
+        records: [],
+    };
+    return {
+        record({readyState, tunnelCancelled, message}) {
+            const sendErrorAfterClose = tunnelCancelled || readyState !== "OPEN";
+            const record = {
+                readyState,
+                tunnelCancelled,
+                message,
+                sendErrorAfterClose,
+            };
+            ledger.records.push(record);
+            if (sendErrorAfterClose) {
+                ledger.sendErrorsAfterClose++;
+            }
+            else {
+                ledger.sendErrors++;
+            }
+            return sendErrorAfterClose;
+        },
+        snapshot() {
+            return {
+                sendErrors: ledger.sendErrors,
+                sendErrorsAfterClose: ledger.sendErrorsAfterClose,
+                records: ledger.records.map((record) => ({...record})),
+            };
+        },
+    };
+}
+
+const sendErrorLedger = makeSendErrorLedger();
+assert.equal(sendErrorLedger.record({
+    readyState: "OPEN", tunnelCancelled: false, message: "active-send-error",
+}), false, "open send error must remain a strict error");
+assert.equal(sendErrorLedger.record({
+    readyState: "CLOSED", tunnelCancelled: false, message: "closed-send-callback",
+}), true, "closed callback error must be classified after-close");
+assert.equal(sendErrorLedger.record({
+    readyState: "OPEN", tunnelCancelled: true, message: "cancelled-send-callback",
+}), true, "cancelled callback error must be classified after-close");
+const sendErrorSnapshot = sendErrorLedger.snapshot();
+assert.equal(sendErrorSnapshot.sendErrors, 1,
+    "open send error was incorrectly removed from strict accounting");
+assert.equal(sendErrorSnapshot.sendErrorsAfterClose, 2,
+    "closed callback errors were not retained in after-close accounting");
+assert.deepEqual(sendErrorSnapshot.records.map((record) => record.sendErrorAfterClose),
+    [false, true, true], "send-error classification record drifted");
+assert.equal(sendErrorSnapshot.records.length, 3,
+    "send-error evidence was dropped instead of classified");
 
 const disabled = makeTimeline(false);
 const disabledSnapshot = disabled.snapshot();
@@ -258,9 +341,16 @@ const result = {
         oneTunnelDropped: bounded.stateByTunnel.get(7).dropped,
         globalRetained: globalSnapshot.samples.length,
         globalDropped: globalSnapshot.globalDropped,
+        sendErrorClassification: {
+            openErrors: sendErrorSnapshot.sendErrors,
+            afterCloseErrors: sendErrorSnapshot.sendErrorsAfterClose,
+            recordsRetained: sendErrorSnapshot.records.length,
+        },
     },
     gates: {
         strictDrainBudgetsUnchanged: true,
+        strictOpenSendErrorsUnchanged: true,
+        closedSendErrorsRetainedSeparately: true,
         payloadFree: true,
         publicRelayRuntimeProof: false,
     },
@@ -269,6 +359,7 @@ const result = {
             "timeline is explicit opt-in and disabled snapshots are metadata-only",
             "enabled records are bounded scalar metadata with monotonic and epoch clocks",
             "per-tunnel and global drop behavior is bounded",
+            "open send errors remain strict while closed callback errors are retained separately",
         ],
         notProven: [
             "this is a server-free model/static contract, not a public relay-host.top run",
