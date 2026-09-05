@@ -1,6 +1,6 @@
 {
   "name": "@gaius/relay-node",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "type": "module",
   "description": "WebSocket-to-TCP translator node for Gaius multiplayer",

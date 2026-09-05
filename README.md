@@ -350,7 +350,10 @@ closes the WebSocket, and verifies that the target lease is released. On hosts
 whose local proxy exposes DNS through the reserved `198.18.0.0/15` fake-IP
 range, the smoke resolves only the RelayNode hostname through DNS-over-HTTPS
 while preserving TLS hostname verification. `GAIUS_PUBLIC_RELAY_EDGE_IP` can
-be used as an explicit diagnostic override.
+be used as an explicit diagnostic override. When a diagnostic URL points at an
+edge IP behind a virtual-host proxy, set `GAIUS_PUBLIC_RELAY_HOST_HEADER` to
+the configured RelayNode host; the smoke sends that value as the
+HTTP/WebSocket `Host` header while leaving normal DNS/TLS behavior unchanged.
 
 The smoke test injects two cleanly truncated 20 MiB resource-pack responses
 whose `Content-Length` still declares the full body, requires the third
