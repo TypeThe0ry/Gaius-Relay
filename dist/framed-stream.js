@@ -70,9 +70,13 @@ export class ByteChunkDeque {
             index++;
         }
         let remaining = this.byteLength - offset;
+        const chunks = this.chunks;
         return {
             get remaining() {
                 return remaining;
+            },
+            get chunkRemaining() {
+                return remaining === 0 ? 0 : chunks[index].byteLength - relative;
             },
             next: () => {
                 if (remaining === 0) {
@@ -276,6 +280,35 @@ export class MinecraftFrameAccumulator {
         return value;
     }
 
+    peekBatch(maxBytes, maxFrames) {
+        if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 ||
+            !Number.isSafeInteger(maxFrames) || maxFrames <= 0) {
+            throw new RangeError("invalid frame batch bounds");
+        }
+        const available = Math.min(this.byteLength, maxBytes);
+        if (available === 0) return [];
+        const bytes = this.deque.copyRange(available);
+        const cursor = this.deque.cursor();
+        const result = [];
+        let offset = 0;
+        while (result.length < maxFrames && offset < bytes.byteLength) {
+            const length = parseLengthFromBytes(bytes, offset);
+            if (length === undefined || length === null) break;
+            if (length.value > this.maximumFrameBytes) break;
+            const frameBytes = length.headerBytes + length.value;
+            if (offset + frameBytes > bytes.byteLength) break;
+            result.push({
+                frame: bytes.subarray(offset, offset + frameBytes),
+                frameBytes,
+                headerBytes: length.headerBytes,
+                coalesced: cursor.chunkRemaining < frameBytes,
+            });
+            cursor.skip(frameBytes);
+            offset += frameBytes;
+        }
+        return result;
+    }
+
     consumeFrame(frame = this.peekFrame()) {
         if (frame === undefined || frame === null) {
             return false;
@@ -333,6 +366,19 @@ function parseLengthFromCursor(cursor) {
             return value > 0x7fffffff
                 ? null
                 : {value, headerBytes: index + 1};
+        }
+    }
+    return null;
+}
+
+function parseLengthFromBytes(bytes, offset) {
+    let value = 0;
+    for (let index = 0; index < 5; index++) {
+        const current = bytes[offset + index];
+        if (current === undefined) return undefined;
+        value += (current & 0x7f) * 2 ** (index * 7);
+        if ((current & 0x80) === 0) {
+            return value > 0x7fffffff ? null : {value, headerBytes: index + 1};
         }
     }
     return null;

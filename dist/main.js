@@ -130,6 +130,10 @@ let activeServerFrameDrainHandles = 0;
 const serverFrameTelemetry = {
     enqueuedFrames: 0,
     enqueuedBytes: 0,
+    webSocketMessages: 0,
+    webSocketBatchMessages: 0,
+    webSocketBatchPackets: 0,
+    webSocketBatchBytes: 0,
     sendErrors: 0,
     // An asynchronous ws send callback can report an error after the tunnel
     // has already entered teardown. Keep that race visible separately so
@@ -256,6 +260,7 @@ const beginRelayFrameTimelineRecord = (state, frame, context = {}) => {
         sourceKind: typeof context.sourceKind === "string"
             ? context.sourceKind : "unknown",
         bytes: frameBytes,
+        packetCount: context.packetCount ?? 1,
         phase: typeof context.phase === "string" ? context.phase : "unknown",
         tcpDataAt: state.pendingTcpDataAt === null
             ? null : { ...state.pendingTcpDataAt },
@@ -1862,13 +1867,14 @@ webSocketServer.on("connection", (webSocket) => {
             clearRelayFrameTcpData(relayFrameTimelineState);
         }
     };
-    const forwardServerFrame = (frame, timelineContext) => {
+    const forwardServerFrame = (frame, timelineContext, packetCount = 1) => {
         const timelineRecord = relayFrameTimelineEnabled
             ? beginRelayFrameTimelineRecord(
                 relayFrameTimelineState,
                 frame,
                 {
                     ...(timelineContext ?? {}),
+                    packetCount,
                     phase: protocolPhase,
                     drainSequence: timelineContext?.drainSequence ??
                         (relayFrameTimelineState?.drainSequence ?? 0),
@@ -1970,8 +1976,14 @@ webSocketServer.on("connection", (webSocket) => {
             });
             return serverFrameForwardResult.ERROR;
         }
-        serverFrameTelemetry.enqueuedFrames++;
+        serverFrameTelemetry.enqueuedFrames += packetCount;
         serverFrameTelemetry.enqueuedBytes += frameBytes;
+        serverFrameTelemetry.webSocketMessages++;
+        if (packetCount > 1) {
+            serverFrameTelemetry.webSocketBatchMessages++;
+            serverFrameTelemetry.webSocketBatchPackets += packetCount;
+            serverFrameTelemetry.webSocketBatchBytes += frameBytes;
+        }
         const bufferedAmount = observeWebSocketBufferedAmount();
         if (timelineRecord !== undefined) {
             timelineRecord.bufferedAmountAfter = bufferedAmount;
@@ -2137,6 +2149,76 @@ webSocketServer.on("connection", (webSocket) => {
                                 // Keep the accumulator intact and let the next
                                 // loop iteration forward its original chunks.
                                 continue;
+                            }
+                            // Batch only ordinary PLAY packets. Keepalive proxying, phase
+                            // transitions, encryption and opaque fallback remain single-frame
+                            // operations so their packet-level semantics and ownership guards
+                            // are unchanged. peekBatch is read-only; consume happens only after
+                            // the one WebSocket send accepts the complete batch.
+                            if (protocolPhase === "play" && minecraftProfile !== undefined) {
+                                const batch = serverFrameBuffer.peekBatch(
+                                    16 * 1024, maximumServerFrameDrainFrames - drainFrames);
+                                if (batch.length > 1) {
+                                    let safe = true;
+                                    for (const candidate of batch) {
+                                        const packet = minecraftPacketId(candidate.frame, candidate.headerBytes);
+                                        const keepAlive = candidate.frame.byteLength === 11 &&
+                                            candidate.frame[0] === 0x0a && candidate.frame[1] === 0x00 &&
+                                            packet !== undefined &&
+                                            packet.id === minecraftProfile.play.clientboundKeepAlive;
+                                        if (keepAlive || isLoginEncryptionRequest(
+                                            candidate.frame, candidate.headerBytes, protocolPhase,
+                                            minecraftProfile) || isPayloadlessPacket(
+                                            candidate.frame, candidate.headerBytes,
+                                            minecraftProfile.play.clientboundStartConfiguration)) {
+                                            safe = false;
+                                            break;
+                                        }
+                                    }
+                                    if (safe) {
+                                        const batchBytes = batch.reduce(
+                                            (total, candidate) => total + candidate.frameBytes, 0);
+                                        const batchFrame = Buffer.concat(
+                                            batch.map((candidate) => candidate.frame), batchBytes);
+                                        let result;
+                                        serverFrameInFlightFrameBytes = batchBytes;
+                                        try {
+                                            result = forwardServerFrame(batchFrame,
+                                                relayFrameTimelineEnabled ? {
+                                                    sourceKind: "parsed-batch",
+                                                    drainSequence: relayDrainSequence,
+                                                    frameReadyAt: relayFrameTimelineClock(),
+                                                } : undefined, batch.length);
+                                        }
+                                        finally {
+                                            serverFrameInFlightFrameBytes = 0;
+                                        }
+                                        if (isEnqueuedServerFrameResult(result)) {
+                                            for (const candidate of batch) {
+                                                observeServerFrameCoalescing(candidate);
+                                                consumeServerFrameBuffer(candidate.frameBytes);
+                                                if (traceTunnel) {
+                                                    const packet = minecraftPacketId(candidate.frame,
+                                                        candidate.headerBytes);
+                                                    if (packet !== undefined) {
+                                                        lastServerPlayPacket =
+                                                            `0x${packet.id.toString(16)}/${candidate.frame.byteLength}`;
+                                                    }
+                                                }
+                                                traceCustomPayload(candidate.frame,
+                                                    candidate.headerBytes, "server", true,
+                                                    minecraftProfile);
+                                            }
+                                            drainFrames += batch.length;
+                                            drainBytes += batchBytes;
+                                            if (result === serverFrameForwardResult.ENQUEUED_PAUSED) break;
+                                            continue;
+                                        }
+                                        if (result === serverFrameForwardResult.PAUSED) break;
+                                        clearServerFrameState();
+                                        break;
+                                    }
+                                }
                             }
                             if (clientFramePhaseWatermarkSettled() &&
                                 proxyVanillaKeepAlive(
