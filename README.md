@@ -21,6 +21,9 @@ GAIUS_MAXIMUM_TARGET_ROUTES=4096 \
 GAIUS_RESOURCE_PACK_CACHE_MS=300000 \
 GAIUS_RESOURCE_PACK_CACHE_BYTES=536870912 \
 GAIUS_RESOURCE_PACK_CACHE_ENTRIES=64 \
+GAIUS_RESOURCE_PACK_HEADERS_TIMEOUT_MS=15000 \
+GAIUS_RESOURCE_PACK_BODY_IDLE_TIMEOUT_MS=15000 \
+GAIUS_RESOURCE_PACK_OVERALL_TIMEOUT_MS=110000 \
 GAIUS_RELAY_NODE_NAME='Example RelayNode' \
 npm start
 ```
@@ -54,7 +57,12 @@ not redownload the same pack from a slow CDN. `GAIUS_RESOURCE_PACK_CACHE_MS`,
 control or disable that cache. Client disconnects cancel unfinished upstream
 downloads without retrying, and all temporary files are removed on eviction,
 failure, or RelayNode exit. Mojang authentication, player textures, Realms, and
-the blocked-server list use the same origin/token-gated HTTP proxy. Their
+the blocked-server list use the same origin/token-gated HTTP proxy. Resource-pack
+upstream headers, body-idle, and complete-download deadlines are controlled by
+`GAIUS_RESOURCE_PACK_HEADERS_TIMEOUT_MS`,
+`GAIUS_RESOURCE_PACK_BODY_IDLE_TIMEOUT_MS`, and
+`GAIUS_RESOURCE_PACK_OVERALL_TIMEOUT_MS`; the total default is kept below common
+edge proxy timeout limits and returns a CORS `504` when exceeded. Their
 idempotent GET requests also retry transient network failures and 429/502/503/504
 responses; authentication and Realms write requests are never replayed.
 

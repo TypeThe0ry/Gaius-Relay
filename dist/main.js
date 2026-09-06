@@ -3230,6 +3230,13 @@ async function handleHttpRequest(request, response) {
             response.end(error.message);
             return;
         }
+        if (proxyKind === "resource-pack" &&
+            (error instanceof ProxyUpstreamTimeoutError ||
+                (error instanceof DOMException && error.name === "AbortError"))) {
+            response.writeHead(504, { ...corsHeaders, "content-type": "text/plain; charset=utf-8" });
+            response.end("Resource-pack upstream timed out");
+            return;
+        }
         throw error;
     }
     try {
@@ -3620,37 +3627,103 @@ async function releaseResourcePackDownload(download) {
 }
 async function downloadResourcePackWithRetries(target, init, maximumBytes) {
     let lastError;
+    const overallDeadline = Date.now() + config.resourcePackOverallTimeoutMs;
     for (let attempt = 0; attempt < resourcePackBodyAttempts; attempt++) {
         let upstream;
         let temporary;
+        let timeoutState;
         try {
             throwIfProxyClientDisconnected(init.signal);
-            upstream = await fetchWithValidatedRedirects(target, init, "resource-pack");
+            if (Date.now() >= overallDeadline) {
+                throw new ProxyUpstreamTimeoutError("resource-pack overall timeout");
+            }
+            timeoutState = createResourcePackTimeoutState(init.signal, overallDeadline);
+            upstream = await fetchWithValidatedRedirects(target, {
+                ...init,
+                signal: timeoutState.signal,
+            }, "resource-pack");
+            timeoutState.headersReceived();
             const declaredLength = parseResponseContentLength(upstream.headers);
-            temporary = await spoolResponseBody(upstream.body, maximumBytes, declaredLength);
+            temporary = await spoolResponseBody(
+                upstream.body, maximumBytes, declaredLength, timeoutState.bodyProgress);
             throwIfProxyClientDisconnected(init.signal);
             traceTunnelEvent(
                 `resource-pack body ready bytes=${temporary.byteLength} attempt=${attempt + 1}`);
             return { upstream, ...temporary };
         }
         catch (error) {
+            if (timeoutState?.signal.aborted && !init.signal.aborted &&
+                !(error instanceof ProxyUpstreamTimeoutError)) {
+                error = new ProxyUpstreamTimeoutError("resource-pack upstream deadline");
+            }
             lastError = error;
             await upstream?.body?.cancel("Retrying interrupted resource-pack body").catch(() => undefined);
             if (temporary?.path !== undefined) {
                 await removeResourcePackTemporaryFile(temporary.path);
             }
             throwIfProxyClientDisconnected(init.signal);
-            if (error instanceof ProxyResponseSizeError || attempt + 1 >= resourcePackBodyAttempts) {
+            if (error instanceof ProxyResponseSizeError ||
+                error instanceof ProxyUpstreamTimeoutError ||
+                (error instanceof DOMException && error.name === "AbortError") ||
+                attempt + 1 >= resourcePackBodyAttempts) {
                 throw error;
             }
             traceTunnelEvent(
                 `retrying interrupted resource-pack body attempt=${attempt + 1} error=`
                     + `${error instanceof Error ? error.message : String(error)}`);
-            await new Promise((resolve) => setTimeout(resolve, 250 * (1 << attempt)));
+            const retryDelay = Math.min(250 * (1 << attempt),
+                Math.max(0, overallDeadline - Date.now()));
+            await new Promise((resolve) => setTimeout(resolve, retryDelay));
             throwIfProxyClientDisconnected(init.signal);
+        }
+        finally {
+            timeoutState?.dispose();
         }
     }
     throw lastError ?? new Error("Resource-pack body download exhausted all retries");
+}
+function createResourcePackTimeoutState(parentSignal, overallDeadline) {
+    const controller = new AbortController();
+    let disposed = false;
+    let headersTimer;
+    let bodyTimer;
+    const overallTimer = setTimeout(() => controller.abort(
+        new ProxyUpstreamTimeoutError("resource-pack overall timeout")),
+    Math.max(1, overallDeadline - Date.now()));
+    const abortFromParent = () => controller.abort(parentSignal.reason);
+    if (parentSignal?.aborted)
+        abortFromParent();
+    else
+        parentSignal?.addEventListener("abort", abortFromParent, {once: true});
+    const armBody = () => {
+        clearTimeout(bodyTimer);
+        bodyTimer = setTimeout(() => controller.abort(
+            new ProxyUpstreamTimeoutError("resource-pack body idle timeout")),
+        config.resourcePackBodyIdleTimeoutMs);
+    };
+    headersTimer = setTimeout(() => controller.abort(
+        new ProxyUpstreamTimeoutError("resource-pack headers timeout")),
+    config.resourcePackHeadersTimeoutMs);
+    return {
+        signal: controller.signal,
+        headersReceived() {
+            clearTimeout(headersTimer);
+            armBody();
+        },
+        bodyProgress() {
+            if (!disposed)
+                armBody();
+        },
+        dispose() {
+            if (disposed)
+                return;
+            disposed = true;
+            clearTimeout(headersTimer);
+            clearTimeout(bodyTimer);
+            clearTimeout(overallTimer);
+            parentSignal?.removeEventListener("abort", abortFromParent);
+        },
+    };
 }
 function parseResponseContentLength(headers) {
     const raw = headers.get("content-length");
@@ -3660,7 +3733,7 @@ function parseResponseContentLength(headers) {
     const parsed = Number(raw);
     return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
-async function spoolResponseBody(body, maximumBytes, declaredLength) {
+async function spoolResponseBody(body, maximumBytes, declaredLength, onProgress) {
     if (declaredLength !== undefined && declaredLength > maximumBytes) {
         throw new ProxyResponseSizeError();
     }
@@ -3677,6 +3750,7 @@ async function spoolResponseBody(body, maximumBytes, declaredLength) {
     let byteLength = 0;
     try {
         for await (const chunk of body) {
+            onProgress?.();
             const buffer = Buffer.isBuffer(chunk)
                 ? chunk
                 : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
@@ -3855,5 +3929,11 @@ class ProxyResponseTruncatedError extends Error {
         this.name = "ProxyResponseTruncatedError";
         this.expectedLength = expectedLength;
         this.receivedLength = receivedLength;
+    }
+}
+class ProxyUpstreamTimeoutError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = "ProxyUpstreamTimeoutError";
     }
 }
