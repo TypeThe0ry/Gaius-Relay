@@ -139,6 +139,8 @@ export function loadConfig() {
             "GAIUS_RESOURCE_PACK_BODY_IDLE_TIMEOUT_MS", 15_000, 1_000, 120_000),
         resourcePackOverallTimeoutMs: parseInteger(
             "GAIUS_RESOURCE_PACK_OVERALL_TIMEOUT_MS", 110_000, 5_000, 120_000),
+        resourcePackStreamOverallTimeoutMs: parseInteger(
+            "GAIUS_RESOURCE_PACK_STREAM_OVERALL_TIMEOUT_MS", 300_000, 5_000, 600_000),
         maximumResourcePackCacheBytes: parseInteger(
             "GAIUS_RESOURCE_PACK_CACHE_BYTES", 512 * 1024 * 1024, 0, 4 * 1024 * 1024 * 1024),
         maximumResourcePackCacheEntries: parseInteger(

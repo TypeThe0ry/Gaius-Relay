@@ -24,6 +24,7 @@ GAIUS_RESOURCE_PACK_CACHE_ENTRIES=64 \
 GAIUS_RESOURCE_PACK_HEADERS_TIMEOUT_MS=15000 \
 GAIUS_RESOURCE_PACK_BODY_IDLE_TIMEOUT_MS=15000 \
 GAIUS_RESOURCE_PACK_OVERALL_TIMEOUT_MS=110000 \
+GAIUS_RESOURCE_PACK_STREAM_OVERALL_TIMEOUT_MS=300000 \
 GAIUS_RELAY_NODE_NAME='Example RelayNode' \
 npm start
 ```
@@ -46,10 +47,14 @@ downloads and defaults to the TCP host list for compatibility. Set the latter
 to the CDN domains used by the allowed servers; this avoids opening arbitrary
 TCP destinations just because a server hosts its pack elsewhere.
 
-Resource-pack bodies are downloaded to a size-limited temporary file before
-the RelayNode sends response headers to Chrome. If an upstream CDN cuts a body
-short, the node retries the complete GET up to three times; the browser receives
-only a complete response with an exact `Content-Length`. A completed `200`
+The client requests `/proxy/resource-pack?stream=1` to receive real resource-pack
+bytes as the upstream downloads them, without waiting for the whole ZIP to finish.
+The node also writes those bytes to a size-limited temporary file and caches it
+only after the body and declared length have been validated. A truncated stream
+is closed and discarded; it is never joined to bytes from another attempt.
+Requests without `stream=1` retain the buffered behavior: download before sending
+headers, retry an interrupted body up to three times, and return the complete
+response with an exact `Content-Length`. Both paths share the cache. A completed `200`
 response is retained in a bounded five-minute disk cache keyed by the complete
 URL and forwarded Minecraft headers, so status-to-join and nearby players do
 not redownload the same pack from a slow CDN. `GAIUS_RESOURCE_PACK_CACHE_MS`,
@@ -61,8 +66,14 @@ the blocked-server list use the same origin/token-gated HTTP proxy. Resource-pac
 upstream headers, body-idle, and complete-download deadlines are controlled by
 `GAIUS_RESOURCE_PACK_HEADERS_TIMEOUT_MS`,
 `GAIUS_RESOURCE_PACK_BODY_IDLE_TIMEOUT_MS`, and
-`GAIUS_RESOURCE_PACK_OVERALL_TIMEOUT_MS`; the total default is kept below common
-edge proxy timeout limits and returns a CORS `504` when exceeded. Their
+`GAIUS_RESOURCE_PACK_OVERALL_TIMEOUT_MS` (buffered requests, default 110 seconds),
+and `GAIUS_RESOURCE_PACK_STREAM_OVERALL_TIMEOUT_MS` (streaming requests, default
+300 seconds, maximum 600 seconds). Headers and idle timeouts still apply to
+streaming requests, including clients stalled by backpressure. A timeout before
+headers returns a CORS `504`; after response data starts, it closes the incomplete
+stream. Streaming requires the updated RelayNode deployment; older nodes ignore
+the query parameter and continue buffering. Reverse proxies must also permit
+streaming instead of buffering the entire response. Their
 idempotent GET requests also retry transient network failures and 429/502/503/504
 responses; authentication and Realms write requests are never replayed.
 

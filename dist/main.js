@@ -3213,7 +3213,8 @@ async function handleHttpRequest(request, response) {
     try {
         if (proxyKind === "resource-pack") {
             resourcePackDownload = await acquireResourcePackDownload(
-                target, upstreamRequest, maximumBytes);
+                target, upstreamRequest, maximumBytes,
+                requestUrl.searchParams.get("stream") === "1");
             upstream = resourcePackDownload.upstream;
         }
         else {
@@ -3255,7 +3256,7 @@ async function handleHttpRequest(request, response) {
             ...corsHeaders,
             "cache-control": "no-store",
             "content-type": upstream.headers.get("content-type") ?? "application/octet-stream",
-            ...(resourcePackDownload === undefined
+            ...(resourcePackDownload?.byteLength === undefined
                 ? {}
                 : { "content-length": String(resourcePackDownload.byteLength) }),
         };
@@ -3268,6 +3269,11 @@ async function handleHttpRequest(request, response) {
             responseHeaders["retry-after"] = retryAfter;
         }
         response.writeHead(upstream.status, responseHeaders);
+        if (resourcePackDownload?.streamToResponse !== undefined) {
+            await resourcePackDownload.streamToResponse(response);
+            response.end();
+            return;
+        }
         let received = 0;
         const responseBody = resourcePackDownload?.path === undefined
             ? upstream.body
@@ -3562,7 +3568,7 @@ function acquireCachedResourcePack(entry) {
         cacheHit: true,
     };
 }
-async function acquireResourcePackDownload(target, init, maximumBytes) {
+async function acquireResourcePackDownload(target, init, maximumBytes, stream = false) {
     throwIfProxyClientDisconnected(init.signal);
     const key = resourcePackCacheKey(target, init);
     const now = Date.now();
@@ -3572,8 +3578,21 @@ async function acquireResourcePackDownload(target, init, maximumBytes) {
         traceTunnelEvent(`resource-pack cache hit bytes=${cached.byteLength}`);
         return acquireCachedResourcePack(cached);
     }
+    if (stream) {
+        return beginStreamingResourcePack(target, init, maximumBytes, key);
+    }
     const download = await downloadResourcePackWithRetries(target, init, maximumBytes);
-    throwIfProxyClientDisconnected(init.signal);
+    try {
+        throwIfProxyClientDisconnected(init.signal);
+    }
+    catch (error) {
+        await removeResourcePackTemporaryFile(download.path);
+        throw error;
+    }
+    return retainCompletedResourcePack(download, key);
+}
+async function retainCompletedResourcePack(download, key) {
+    pruneResourcePackCache();
     const cacheable = resourcePackCacheEnabled() &&
         download.path !== undefined &&
         download.byteLength > 0 &&
@@ -3612,6 +3631,7 @@ async function releaseResourcePackDownload(download) {
     if (download === undefined) {
         return;
     }
+    await download.disposeStream?.();
     if (download.cacheEntry !== undefined) {
         const entry = download.cacheEntry;
         entry.readers = Math.max(0, entry.readers - 1);
@@ -3623,6 +3643,65 @@ async function releaseResourcePackDownload(download) {
     }
     if (download.deleteAfterUse && download.path !== undefined) {
         await removeResourcePackTemporaryFile(download.path);
+    }
+}
+async function beginStreamingResourcePack(target, init, maximumBytes, key) {
+    const timeoutState = createResourcePackTimeoutState(init.signal,
+        Date.now() + config.resourcePackStreamOverallTimeoutMs);
+    let upstream;
+    let consumed = false;
+    try {
+        upstream = await fetchWithValidatedRedirects(target, {
+            ...init, signal: timeoutState.signal,
+        }, "resource-pack");
+        timeoutState.headersReceived();
+        const declaredLength = parseResponseContentLength(upstream.headers);
+        if (declaredLength !== undefined && declaredLength > maximumBytes) {
+            throw new ProxyResponseSizeError();
+        }
+        const download = {
+            upstream,
+            // Use chunked HTTP until the body has been validated. In particular,
+            // do not expose a guessed length or append retry bytes to a partial ZIP.
+            async streamToResponse(response) {
+                consumed = true;
+                const abort = () => response.destroy();
+                timeoutState.signal.addEventListener("abort", abort, {once: true});
+                let temporary;
+                try {
+                    timeoutState.signal.throwIfAborted();
+                    temporary = await spoolResponseBody(upstream.body, maximumBytes,
+                        declaredLength, timeoutState.bodyProgress,
+                        (chunk) => writeHttpChunk(response, chunk));
+                    timeoutState.signal.throwIfAborted();
+                    Object.assign(download, await retainCompletedResourcePack(
+                        {upstream, ...temporary}, key));
+                    temporary = undefined;
+                }
+                finally {
+                    timeoutState.signal.removeEventListener("abort", abort);
+                    timeoutState.dispose();
+                    if (temporary !== undefined) {
+                        await removeResourcePackTemporaryFile(temporary.path);
+                    }
+                }
+            },
+            async disposeStream() {
+                timeoutState.dispose();
+                if (!consumed) {
+                    await upstream.body?.cancel().catch(() => undefined);
+                }
+            },
+        };
+        return download;
+    }
+    catch (error) {
+        await upstream?.body?.cancel().catch(() => undefined);
+        if (timeoutState.signal.aborted && !init.signal?.aborted) {
+            error = new ProxyUpstreamTimeoutError("resource-pack upstream deadline");
+        }
+        timeoutState.dispose();
+        throw error;
     }
 }
 async function downloadResourcePackWithRetries(target, init, maximumBytes) {
@@ -3733,7 +3812,7 @@ function parseResponseContentLength(headers) {
     const parsed = Number(raw);
     return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
-async function spoolResponseBody(body, maximumBytes, declaredLength, onProgress) {
+async function spoolResponseBody(body, maximumBytes, declaredLength, onProgress, onChunk) {
     if (declaredLength !== undefined && declaredLength > maximumBytes) {
         throw new ProxyResponseSizeError();
     }
@@ -3766,6 +3845,9 @@ async function spoolResponseBody(body, maximumBytes, declaredLength, onProgress)
                     throw new Error("Resource-pack temporary file stopped accepting data");
                 }
                 offset += result.bytesWritten;
+            }
+            if (onChunk !== undefined) {
+                await onChunk(buffer);
             }
         }
         if (declaredLength !== undefined && byteLength !== declaredLength) {
