@@ -396,9 +396,14 @@ registration test can provide `{"password":"...","confirm":"..."}`. For
 real external tests, prefer `GAIUS_SMOKE_DIALOG_INPUTS_FILE` pointing to an
 owner-readable-only JSON file with the same object, so credentials do not enter
 the process command line, environment value, or evidence logs. Use a disposable
-test account because registration changes server state. The production client
-keeps the normal visible screens and never accepts a server policy or submits
-credentials silently.
+test account because registration changes server state. If a server emits more
+than one dynamic dialog for one login (for example, an outer AuthMe dialog
+followed by a separate password submit dialog), set
+`GAIUS_SMOKE_DIALOG_ACTION_IDS` to a comma-separated action sequence in the
+same order; this is mutually exclusive with the single-dialog
+`GAIUS_SMOKE_DIALOG_ACTION_ID` override. The production client keeps the normal
+visible screens and never accepts a server policy or submits credentials
+silently.
 
 ## Container deployment
 
