@@ -1,6 +1,6 @@
 {
   "name": "@gaius/relay-node",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "WebSocket-to-TCP translator node for Gaius multiplayer",
@@ -10,8 +10,17 @@
   "scripts": {
     "start": "node dist/main.js",
     "start:registry": "node dist/registry.js",
-    "smoke": "node multiplayer-smoke.mjs && node registry-smoke.mjs && node local-relay/scripts/browser-relay-routing-smoke.mjs",
-    "smoke:public": "node public-relay-smoke.mjs"
+    "smoke": "node framed-stream-smoke.mjs && node relay-frame-batching-smoke.mjs && node client-tcp-bounded-drain-smoke.mjs && node server-packet-processor-isolation-smoke.mjs && node multiplayer-smoke.mjs && node resource-pack-timeout-smoke.mjs && node resource-pack-stream-smoke.mjs && node registry-smoke.mjs && node local-relay/scripts/browser-http-proxy-routing-smoke.mjs && node local-relay/scripts/browser-relay-routing-smoke.mjs && node local-relay/scripts/browser-inbound-backpressure-smoke.mjs && node local-relay/scripts/browser-outbound-backpressure-smoke.mjs && node local-relay/scripts/browser-global-pump-fairness-smoke.mjs && node local-relay/scripts/client-packet-drain-smoke.mjs && node local-relay/scripts/browser-bridge-install-lifecycle-smoke.mjs && node local-relay/scripts/browser-inbound-pump-jsbody-smoke.mjs && node local-relay/scripts/browser-compression-decoder-model-smoke.mjs && node local-relay/scripts/browser-compression-decoder-production-smoke.mjs && node browser-full-path-contract-smoke.mjs && node browser-arrival-timeline-runtime-smoke.mjs",
+    "smoke:profiles": "node profile-protocol-smoke.mjs",
+    "smoke:public": "node public-relay-smoke.mjs",
+    "smoke:browser-full-path": "node browser-full-path-smoke.mjs",
+    "stress:browser-full-path": "node browser-full-path-stress.mjs",
+    "smoke:browser-full-path-contract": "node browser-full-path-contract-smoke.mjs",
+    "smoke:browser-arrival-timeline-runtime": "node browser-arrival-timeline-runtime-smoke.mjs",
+    "smoke:browser-full-path-artifact": "node browser-full-path-artifact-contract-smoke.mjs",
+    "smoke:encryption-request": "node encryption-request-smoke.mjs",
+    "smoke:browser-full-path-acceptance": "node browser-full-path-acceptance.mjs",
+    "smoke:external-multiplayer": "node local-relay/scripts/browser-relay-external-multiplayer-smoke.mjs"
   },
   "dependencies": {
     "ws": "8.21.0"
