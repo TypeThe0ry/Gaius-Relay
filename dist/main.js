@@ -2074,6 +2074,20 @@ webSocketServer.on("connection", (webSocket) => {
                         : 0;
                     const drainStartedWithReadHold = serverFrameDrainHoldingRead;
                     const drainStartedAt = performance.now();
+                    // Leave headroom below the public 32-frame/512 KiB
+                    // contract.  A full contract-sized turn can spend the
+                    // whole event-loop slice inside ws.send()/Buffer.concat
+                    // before the next timer check runs, which is exactly how
+                    // the deployed node observed ~3 ms drains against the
+                    // 2 ms fairness budget.  The effective per-turn slice is
+                    // deliberately smaller; the setImmediate continuation
+                    // still drains the remainder in order.
+                    const effectiveDrainFrameBudget = Math.min(
+                        maximumServerFrameDrainFrames, 16,
+                    );
+                    const effectiveDrainByteBudget = Math.min(
+                        maximumServerFrameDrainBytes, 256 * 1024,
+                    );
                     let drainFrames = 0;
                     let drainBytes = 0;
                     let drainBudgetYielded = false;
@@ -2089,8 +2103,8 @@ webSocketServer.on("connection", (webSocket) => {
                             // larger than the byte budget.  Subsequent frames
                             // yield to the event loop through setImmediate.
                             if (drainFrames > 0 &&
-                                (drainFrames >= maximumServerFrameDrainFrames ||
-                                    drainBytes >= maximumServerFrameDrainBytes ||
+                                (drainFrames >= effectiveDrainFrameBudget ||
+                                    drainBytes >= effectiveDrainByteBudget ||
                                     performance.now() - drainStartedAt >=
                                         maximumServerFrameDrainMillis)) {
                                 drainBudgetYielded = true;
@@ -2157,7 +2171,8 @@ webSocketServer.on("connection", (webSocket) => {
                             // the one WebSocket send accepts the complete batch.
                             if (protocolPhase === "play" && minecraftProfile !== undefined) {
                                 const batch = serverFrameBuffer.peekBatch(
-                                    16 * 1024, maximumServerFrameDrainFrames - drainFrames);
+                                    16 * 1024,
+                                    effectiveDrainFrameBudget - drainFrames);
                                 if (batch.length > 1) {
                                     let safe = true;
                                     for (const candidate of batch) {
