@@ -117,6 +117,12 @@ let publicDnsCacheHits = 0;
 let publicDnsCacheMisses = 0;
 let publicDnsCacheInflightJoins = 0;
 const resourcePackCache = new Map();
+// Cache misses for the same request identity must share one upstream spool.
+// In particular, a streaming response can finish downloading while its first
+// downstream reader is still paused.  Keep that download visible here until
+// the verified temporary file is published to resourcePackCache so a second
+// request cannot race the cache insertion and start a duplicate upstream GET.
+const resourcePackInflight = new Map();
 const resourcePackTemporaryPaths = new Set();
 let resourcePackCacheBytes = 0;
 const relayStartedAt = Date.now();
@@ -3671,28 +3677,81 @@ function acquireCachedResourcePack(entry) {
         cacheHit: true,
     };
 }
+function createResourcePackInflight(key) {
+    let resolve;
+    const promise = new Promise((settle) => {
+        resolve = settle;
+    });
+    const inflight = { promise, resolve, settled: false };
+    resourcePackInflight.set(key, inflight);
+    return inflight;
+}
+function settleResourcePackInflight(key, inflight) {
+    if (inflight === undefined || inflight.settled) {
+        return;
+    }
+    inflight.settled = true;
+    if (resourcePackInflight.get(key) === inflight) {
+        resourcePackInflight.delete(key);
+    }
+    inflight.resolve();
+}
+async function waitForResourcePackInflight(inflight, signal) {
+    throwIfProxyClientDisconnected(signal);
+    let abort;
+    const disconnected = new Promise((_, reject) => {
+        abort = () => reject(new ProxyClientDisconnectedError());
+        signal?.addEventListener("abort", abort, { once: true });
+    });
+    try {
+        await Promise.race([inflight.promise, disconnected]);
+        throwIfProxyClientDisconnected(signal);
+    }
+    finally {
+        signal?.removeEventListener("abort", abort);
+    }
+}
 async function acquireResourcePackDownload(target, init, maximumBytes, stream = false) {
     throwIfProxyClientDisconnected(init.signal);
     const key = resourcePackCacheKey(target, init);
-    const now = Date.now();
-    pruneResourcePackCache(now);
-    const cached = resourcePackCache.get(key);
-    if (cached !== undefined && now < cached.expiresAt && !cached.evicted) {
-        traceTunnelEvent(`resource-pack cache hit bytes=${cached.byteLength}`);
-        return acquireCachedResourcePack(cached);
-    }
-    if (stream) {
-        return beginStreamingResourcePack(target, init, maximumBytes, key);
-    }
-    const download = await downloadResourcePackWithRetries(target, init, maximumBytes);
+    let inflight;
     try {
-        throwIfProxyClientDisconnected(init.signal);
+        for (;;) {
+            const now = Date.now();
+            pruneResourcePackCache(now);
+            const cached = resourcePackCache.get(key);
+            if (cached !== undefined && now < cached.expiresAt && !cached.evicted) {
+                traceTunnelEvent(`resource-pack cache hit bytes=${cached.byteLength}`);
+                return acquireCachedResourcePack(cached);
+            }
+            const incumbent = resourcePackInflight.get(key);
+            if (!resourcePackCacheEnabled() || incumbent === undefined) {
+                inflight = resourcePackCacheEnabled()
+                    ? createResourcePackInflight(key)
+                    : undefined;
+                break;
+            }
+            traceTunnelEvent("resource-pack cache wait for in-flight spool");
+            await waitForResourcePackInflight(incumbent, init.signal);
+        }
+        if (stream) {
+            return await beginStreamingResourcePack(target, init, maximumBytes, key, inflight);
+        }
+        const download = await downloadResourcePackWithRetries(target, init, maximumBytes);
+        try {
+            throwIfProxyClientDisconnected(init.signal);
+        }
+        catch (error) {
+            await removeResourcePackTemporaryFile(download.path);
+            throw error;
+        }
+        return await retainCompletedResourcePack(download, key);
     }
-    catch (error) {
-        await removeResourcePackTemporaryFile(download.path);
-        throw error;
+    finally {
+        if (!stream) {
+            settleResourcePackInflight(key, inflight);
+        }
     }
-    return retainCompletedResourcePack(download, key);
 }
 async function retainCompletedResourcePack(download, key) {
     pruneResourcePackCache();
@@ -3748,7 +3807,7 @@ async function releaseResourcePackDownload(download) {
         await removeResourcePackTemporaryFile(download.path);
     }
 }
-async function beginStreamingResourcePack(target, init, maximumBytes, key) {
+async function beginStreamingResourcePack(target, init, maximumBytes, key, inflight) {
     const timeoutState = createResourcePackTimeoutState(init.signal,
         Date.now() + config.resourcePackStreamOverallTimeoutMs);
     let upstream;
@@ -3785,10 +3844,12 @@ async function beginStreamingResourcePack(target, init, maximumBytes, key) {
                             const retained = await retainCompletedResourcePack(
                                 {upstream, ...temporary}, key);
                             Object.assign(download, retained);
+                            settleResourcePackInflight(key, inflight);
                             return retained;
                         }
                         catch (error) {
                             spool.fail(error);
+                            settleResourcePackInflight(key, inflight);
                             throw error;
                         }
                     })();
@@ -3820,6 +3881,7 @@ async function beginStreamingResourcePack(target, init, maximumBytes, key) {
                 if (!consumed) {
                     await upstream.body?.cancel().catch(() => undefined);
                 }
+                settleResourcePackInflight(key, inflight);
             },
         };
         return download;
@@ -3830,6 +3892,7 @@ async function beginStreamingResourcePack(target, init, maximumBytes, key) {
             error = new ProxyUpstreamTimeoutError("resource-pack upstream deadline");
         }
         timeoutState.dispose();
+        settleResourcePackInflight(key, inflight);
         throw error;
     }
 }

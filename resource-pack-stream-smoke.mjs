@@ -19,6 +19,9 @@ const listen = async (server) => {
 const hits = new Map();
 const timers = new Set();
 let finishGated;
+let finishCoalesced;
+let failCoalesced;
+let canceledUnconsumed = 0;
 let upstreamClosed = 0;
 let decoupledUpstreamFinished = false;
 const bytes = Buffer.from([80, 75, 3, 4, 0, 255, 27, 10, 99]);
@@ -38,6 +41,35 @@ const fixture = createServer((request, response) => {
   }
   if (path === "/cache.zip") {
     response.end(bytes);
+    return;
+  }
+  if (path === "/coalesced.zip") {
+    const total = 4 * 1024 * 1024;
+    response.writeHead(200, {"content-length": String(total)});
+    response.write(Buffer.alloc(64 * 1024, 0x43));
+    finishCoalesced = () => response.end(Buffer.alloc(total - 64 * 1024, 0x43));
+    return;
+  }
+  if (path === "/coalesced-fail.zip") {
+    if ((hits.get(path) ?? 0) > 1) {
+      response.writeHead(200, {"content-length": String(251 * 1024 * 1024)});
+      response.flushHeaders();
+      return;
+    }
+    response.writeHead(200, {"content-length": String(4 * 1024 * 1024)});
+    response.write(Buffer.alloc(64 * 1024, 0x46));
+    failCoalesced = () => response.destroy();
+    return;
+  }
+  if (path === "/unconsumed.zip") {
+    if ((hits.get(path) ?? 0) > 1) {
+      response.writeHead(200, {"content-length": String(251 * 1024 * 1024)});
+      response.flushHeaders();
+      return;
+    }
+    response.on("close", () => canceledUnconsumed++);
+    response.writeHead(200, {"content-length": String(4 * 1024 * 1024)});
+    response.flushHeaders();
     return;
   }
   if (path === "/backpressure.zip") {
@@ -123,12 +155,23 @@ const request = (path, options = {}) => fetch(url(path), {
 });
 const tempFiles = async () => (await readdir(tmpdir()))
   .filter((name) => name.startsWith(`gaius-relay-resource-pack-${bridge.pid}-`));
+let initialTempFiles;
+const currentTempFiles = async () => {
+  const names = await tempFiles();
+  return initialTempFiles === undefined
+    ? names
+    : names.filter((name) => !initialTempFiles.has(name));
+};
 try {
   const deadline = Date.now() + 5000;
   while (!output.includes("Gaius translator node listening")) {
     assert.ok(Date.now() < deadline, `bridge startup failed: ${output}`);
     await delay(20);
   }
+  // A recycled process id can leave old crash artifacts with this bridge's
+  // filename prefix.  Track only files created by this test process so exact
+  // cache/cleanup counts stay deterministic without deleting unrelated data.
+  initialTempFiles = new Set(await tempFiles());
 
   // The upstream cannot finish until this client receives the first bytes.
   // A spool-before-response implementation deterministically deadlocks here.
@@ -155,8 +198,85 @@ try {
     assert.deepEqual(Buffer.from(await result.arrayBuffer()), bytes);
   }
   assert.equal(hits.get("/cache.zip"), 2, "cache identity must retain forwarded user headers");
-  let completedFiles = (await tempFiles()).sort();
+  let completedFiles = (await currentTempFiles()).sort();
   assert.equal(completedFiles.length, 3);
+
+  // A cache miss owns its key until its complete, length-checked spool is
+  // published.  A concurrent request must wait for that publication instead
+  // of opening a second upstream response (and must never consume partial
+  // bytes as a cache hit).
+  const coalesced = get(url("/coalesced.zip"), {headers: {origin}}, (body) => body.pause());
+  coalesced.on("error", () => {});
+  try {
+    const coalescedDeadline = Date.now() + 2000;
+    while (finishCoalesced === undefined) {
+      assert.ok(Date.now() < coalescedDeadline, "first coalesced spool did not reach upstream");
+      await delay(20);
+    }
+    const joined = fetch(url("/coalesced.zip", false), {headers: {origin}});
+    await delay(100);
+    assert.equal(hits.get("/coalesced.zip"), 1,
+      "concurrent cache miss must join the in-flight resource-pack spool");
+    finishCoalesced();
+    assert.equal((await (await joined).arrayBuffer()).byteLength, 4 * 1024 * 1024);
+    assert.equal(hits.get("/coalesced.zip"), 1);
+  } finally {
+    coalesced.destroy();
+  }
+  completedFiles = (await currentTempFiles()).sort();
+  assert.equal(completedFiles.length, 4);
+
+  // Failed owners must also release their key.  Waiters may retry upstream,
+  // but they must neither hang behind a rejected producer nor observe/cache
+  // the partial spool.
+  const failedOwner = get(url("/coalesced-fail.zip"), {headers: {origin}}, (body) => body.resume());
+  failedOwner.on("error", () => {});
+  try {
+    const failedDeadline = Date.now() + 2000;
+    while (failCoalesced === undefined) {
+      assert.ok(Date.now() < failedDeadline, "failed coalesced spool did not reach upstream");
+      await delay(20);
+    }
+    const retryAfterFailure = fetch(url("/coalesced-fail.zip", false), {headers: {origin}});
+    await delay(100);
+    assert.equal(hits.get("/coalesced-fail.zip"), 1,
+      "waiter opened upstream before the failed owner released its in-flight key");
+    failCoalesced();
+    const failedRetry = await retryAfterFailure;
+    assert.equal(failedRetry.status, 413);
+    await failedRetry.text();
+    assert.equal(hits.get("/coalesced-fail.zip"), 2,
+      "waiter must retry after an in-flight spool fails");
+  } finally {
+    failedOwner.destroy();
+  }
+  assert.deepEqual((await currentTempFiles()).sort(), completedFiles,
+    "failed coalesced spools must not enter cache or leak temporary files");
+
+  // If the HTTP client disappears after acquire/before streamToResponse, the
+  // unconsumed stream's dispose path must cancel upstream and release the key.
+  const unconsumed = get(url("/unconsumed.zip"), {headers: {origin}});
+  unconsumed.on("error", () => {});
+  try {
+    const unconsumedDeadline = Date.now() + 2000;
+    while ((hits.get("/unconsumed.zip") ?? 0) < 1) {
+      assert.ok(Date.now() < unconsumedDeadline, "unconsumed owner did not reach upstream");
+      await delay(20);
+    }
+    unconsumed.destroy();
+    const releasedDeadline = Date.now() + 2000;
+    while (canceledUnconsumed < 1) {
+      assert.ok(Date.now() < releasedDeadline, "unconsumed owner did not cancel upstream");
+      await delay(20);
+    }
+    const retry = await fetch(url("/unconsumed.zip", false), {headers: {origin}});
+    assert.equal(retry.status, 413);
+    await retry.text();
+    assert.equal(hits.get("/unconsumed.zip"), 2,
+      "unconsumed owner must release its in-flight key for a subsequent request");
+  } finally {
+    unconsumed.destroy();
+  }
 
   // The live sender must not serialize every upstream read behind a paused
   // downstream drain. This body fits inside the bounded fan-out window, so it
@@ -177,8 +297,8 @@ try {
   } finally {
     paused.destroy();
   }
-  completedFiles = (await tempFiles()).sort();
-  assert.equal(completedFiles.length, 4);
+  completedFiles = (await currentTempFiles()).sort();
+  assert.equal(completedFiles.length, 5);
 
   for (let attempt = 0; attempt < 2; attempt++) {
     const broken = await request("/truncated.zip");
@@ -203,7 +323,7 @@ try {
   await assert.rejects(() => canceledReader.read());
   const cleanupDeadline = Date.now() + 1500;
   while (upstreamClosed <= closedBefore ||
-      JSON.stringify((await tempFiles()).sort()) !== JSON.stringify(completedFiles)) {
+      JSON.stringify((await currentTempFiles()).sort()) !== JSON.stringify(completedFiles)) {
     assert.ok(Date.now() < cleanupDeadline, "disconnect/failed stream leaked upstream or temporary file");
     await delay(20);
   }
@@ -211,7 +331,7 @@ try {
   assert.equal(oversized.status, 413);
   assert.equal(oversized.headers.get("access-control-allow-origin"), origin);
   await oversized.text();
-  assert.deepEqual((await tempFiles()).sort(), completedFiles);
+  assert.deepEqual((await currentTempFiles()).sort(), completedFiles);
   const pressureClosedBefore = upstreamClosed;
   const stalledRequest = get(url("/backpressure.zip"), {headers: {origin}}, (body) => body.pause());
   stalledRequest.on("error", () => {});
@@ -221,7 +341,7 @@ try {
       assert.ok(Date.now() < deadline, "timeout must release a downstream stalled on drain");
       await delay(20);
     }
-    const pressureFiles = (await tempFiles()).sort();
+    const pressureFiles = (await currentTempFiles()).sort();
     assert.ok(pressureFiles.length === completedFiles.length ||
       pressureFiles.length === completedFiles.length + 1,
     "stalled downstream left an unbounded or duplicate resource-pack spool");
@@ -234,7 +354,7 @@ try {
   } finally {
     stalledRequest.destroy();
   }
-  console.log("resource-pack-stream-smoke: PASS (early bytes, exact body, shared/scoped cache, truncation, idle/overall deadlines, cancel cleanup, size guard, downstream backpressure)");
+  console.log("resource-pack-stream-smoke: PASS (early bytes, exact body, in-flight coalescing, shared/scoped cache, truncation, idle/overall deadlines, cancel cleanup, size guard, downstream backpressure)");
 } finally {
   if (bridge.exitCode === null) {
     bridge.stdin?.write("graceful-shutdown\n");
