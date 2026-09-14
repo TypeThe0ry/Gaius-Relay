@@ -20,6 +20,7 @@ const hits = new Map();
 const timers = new Set();
 let finishGated;
 let upstreamClosed = 0;
+let decoupledUpstreamFinished = false;
 const bytes = Buffer.from([80, 75, 3, 4, 0, 255, 27, 10, 99]);
 const fixture = createServer((request, response) => {
   const path = new URL(request.url, `http://${host}`).pathname;
@@ -57,6 +58,27 @@ const fixture = createServer((request, response) => {
     pump();
     return;
   }
+  if (path === "/decoupled.zip") {
+    const total = 4 * 1024 * 1024;
+    response.writeHead(200, {"content-length": String(total)});
+    const chunk = Buffer.alloc(64 * 1024, 0x44);
+    let remaining = total / chunk.byteLength;
+    const pump = () => {
+      while (remaining > 0 && !response.destroyed) {
+        remaining--;
+        if (!response.write(chunk)) {
+          response.once("drain", pump);
+          return;
+        }
+      }
+      if (!response.destroyed) {
+        decoupledUpstreamFinished = true;
+        response.end();
+      }
+    };
+    pump();
+    return;
+  }
   response.on("close", () => upstreamClosed++);
   response.writeHead(200, {"content-length": "1000000"});
   response.write(bytes);
@@ -84,7 +106,7 @@ const bridge = spawn(process.execPath, ["dist/main.js"], {
     GAIUS_RESOURCE_PACK_BODY_IDLE_TIMEOUT_MS: "1000",
     GAIUS_RESOURCE_PACK_STREAM_OVERALL_TIMEOUT_MS: "5000",
     GAIUS_RESOURCE_PACK_CACHE_MS: "60000"},
-  stdio: ["ignore", "pipe", "pipe"],
+  stdio: ["pipe", "pipe", "pipe"],
 });
 let output = "";
 bridge.stdout.on("data", (chunk) => { output += chunk; });
@@ -133,8 +155,30 @@ try {
     assert.deepEqual(Buffer.from(await result.arrayBuffer()), bytes);
   }
   assert.equal(hits.get("/cache.zip"), 2, "cache identity must retain forwarded user headers");
-  const completedFiles = (await tempFiles()).sort();
+  let completedFiles = (await tempFiles()).sort();
   assert.equal(completedFiles.length, 3);
+
+  // The live sender must not serialize every upstream read behind a paused
+  // downstream drain. This body fits inside the bounded fan-out window, so it
+  // should finish and enter the shared cache while the first client is paused.
+  const paused = get(url("/decoupled.zip"), {headers: {origin}}, (body) => body.pause());
+  paused.on("error", () => {});
+  try {
+    const decoupledDeadline = Date.now() + 2000;
+    while (!decoupledUpstreamFinished) {
+      assert.ok(Date.now() < decoupledDeadline,
+        "slow downstream serialized and stalled the upstream resource-pack spool");
+      await delay(20);
+    }
+    const cachedWhilePaused = await fetch(url("/decoupled.zip", false), {headers: {origin}});
+    assert.equal((await cachedWhilePaused.arrayBuffer()).byteLength, 4 * 1024 * 1024);
+    assert.equal(hits.get("/decoupled.zip"), 1,
+      "completed upstream spool must be cache-visible while the original sender is paused");
+  } finally {
+    paused.destroy();
+  }
+  completedFiles = (await tempFiles()).sort();
+  assert.equal(completedFiles.length, 4);
 
   for (let attempt = 0; attempt < 2; attempt++) {
     const broken = await request("/truncated.zip");
@@ -173,17 +217,31 @@ try {
   stalledRequest.on("error", () => {});
   try {
     const deadline = Date.now() + 7000;
-    while (upstreamClosed <= pressureClosedBefore ||
-        JSON.stringify((await tempFiles()).sort()) !== JSON.stringify(completedFiles)) {
+    while (upstreamClosed <= pressureClosedBefore) {
       assert.ok(Date.now() < deadline, "timeout must release a downstream stalled on drain");
       await delay(20);
+    }
+    const pressureFiles = (await tempFiles()).sort();
+    assert.ok(pressureFiles.length === completedFiles.length ||
+      pressureFiles.length === completedFiles.length + 1,
+    "stalled downstream left an unbounded or duplicate resource-pack spool");
+    if (pressureFiles.length === completedFiles.length + 1) {
+      const cachedPressure = await fetch(url("/backpressure.zip", false), {headers: {origin}});
+      assert.equal((await cachedPressure.arrayBuffer()).byteLength, 64 * 1024 * 1024);
+      assert.equal(hits.get("/backpressure.zip"), 1,
+        "a fully spooled body should remain cache-visible after the slow sender times out");
     }
   } finally {
     stalledRequest.destroy();
   }
   console.log("resource-pack-stream-smoke: PASS (early bytes, exact body, shared/scoped cache, truncation, idle/overall deadlines, cancel cleanup, size guard, downstream backpressure)");
 } finally {
-  bridge.kill();
+  if (bridge.exitCode === null) {
+    bridge.stdin?.write("graceful-shutdown\n");
+    const exited = new Promise((resolve) => bridge.once("exit", resolve));
+    await Promise.race([exited, delay(3500)]);
+    if (bridge.exitCode === null) bridge.kill();
+  }
   for (const timer of timers) clearTimeout(timer);
   fixture.closeAllConnections();
   await new Promise((resolve) => fixture.close(resolve));

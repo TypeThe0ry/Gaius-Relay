@@ -48,10 +48,15 @@ to the CDN domains used by the allowed servers; this avoids opening arbitrary
 TCP destinations just because a server hosts its pack elsewhere.
 
 The client requests `/proxy/resource-pack?stream=1` to receive real resource-pack
-bytes as the upstream downloads them, without waiting for the whole ZIP to finish.
-The node also writes those bytes to a size-limited temporary file and caches it
-only after the body and declared length have been validated. A truncated stream
-is closed and discarded; it is never joined to bytes from another attempt.
+bytes while the upstream download is still in progress. The RelayNode forwards a
+valid upstream `Content-Length`, independently spools the upstream body to a
+size-limited temporary file, and lets the downstream response tail completed file
+regions through a fixed 256 KiB read window. A slow browser or reverse proxy
+therefore cannot serialize every upstream read behind its HTTP backpressure, and
+memory usage stays bounded regardless of pack size. The shared cache is populated
+only after the complete body and declared length have been validated. A truncated
+or failed spool is closed and discarded; partial bytes are never cached or joined
+to bytes from another attempt.
 Requests without `stream=1` retain the buffered behavior: download before sending
 headers, retry an interrupted body up to three times, and return the complete
 response with an exact `Content-Length`. Both paths share the cache. A completed `200`
