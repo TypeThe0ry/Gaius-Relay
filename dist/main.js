@@ -33,6 +33,10 @@ const relayNodeProtocolVersion = 1;
 const relayNodeManifestPath = "/relay-node/v1";
 const relayNodeRuntimePath = "/relay-node/v1.runtime";
 const maximumResourcePackBytes = 250 * 1024 * 1024;
+// The live resource-pack sender tails the same temporary file that becomes the
+// verified cache entry. Only this fixed read window is held in memory even if a
+// reverse proxy is much slower than the upstream download.
+const maximumResourcePackStreamReadBytes = 256 * 1024;
 const maximumTextureBytes = 16 * 1024 * 1024;
 const maximumAuthResponseBytes = 4 * 1024 * 1024;
 const maximumAuthRequestBytes = 1024 * 1024;
@@ -113,6 +117,12 @@ let publicDnsCacheHits = 0;
 let publicDnsCacheMisses = 0;
 let publicDnsCacheInflightJoins = 0;
 const resourcePackCache = new Map();
+// Cache misses for the same request identity must share one upstream spool.
+// In particular, a streaming response can finish downloading while its first
+// downstream reader is still paused.  Keep that download visible here until
+// the verified temporary file is published to resourcePackCache so a second
+// request cannot race the cache insertion and start a duplicate upstream GET.
+const resourcePackInflight = new Map();
 const resourcePackTemporaryPaths = new Set();
 let resourcePackCacheBytes = 0;
 const relayStartedAt = Date.now();
@@ -3353,9 +3363,11 @@ async function handleHttpRequest(request, response) {
             ...corsHeaders,
             "cache-control": "no-store",
             "content-type": upstream.headers.get("content-type") ?? "application/octet-stream",
-            ...(resourcePackDownload?.byteLength === undefined
+            ...(resourcePackDownload?.byteLength === undefined &&
+                resourcePackDownload?.declaredByteLength === undefined
                 ? {}
-                : { "content-length": String(resourcePackDownload.byteLength) }),
+                : { "content-length": String(resourcePackDownload.byteLength ??
+                    resourcePackDownload.declaredByteLength) }),
         };
         const contentDisposition = upstream.headers.get("content-disposition");
         if (contentDisposition !== null) {
@@ -3665,28 +3677,81 @@ function acquireCachedResourcePack(entry) {
         cacheHit: true,
     };
 }
+function createResourcePackInflight(key) {
+    let resolve;
+    const promise = new Promise((settle) => {
+        resolve = settle;
+    });
+    const inflight = { promise, resolve, settled: false };
+    resourcePackInflight.set(key, inflight);
+    return inflight;
+}
+function settleResourcePackInflight(key, inflight) {
+    if (inflight === undefined || inflight.settled) {
+        return;
+    }
+    inflight.settled = true;
+    if (resourcePackInflight.get(key) === inflight) {
+        resourcePackInflight.delete(key);
+    }
+    inflight.resolve();
+}
+async function waitForResourcePackInflight(inflight, signal) {
+    throwIfProxyClientDisconnected(signal);
+    let abort;
+    const disconnected = new Promise((_, reject) => {
+        abort = () => reject(new ProxyClientDisconnectedError());
+        signal?.addEventListener("abort", abort, { once: true });
+    });
+    try {
+        await Promise.race([inflight.promise, disconnected]);
+        throwIfProxyClientDisconnected(signal);
+    }
+    finally {
+        signal?.removeEventListener("abort", abort);
+    }
+}
 async function acquireResourcePackDownload(target, init, maximumBytes, stream = false) {
     throwIfProxyClientDisconnected(init.signal);
     const key = resourcePackCacheKey(target, init);
-    const now = Date.now();
-    pruneResourcePackCache(now);
-    const cached = resourcePackCache.get(key);
-    if (cached !== undefined && now < cached.expiresAt && !cached.evicted) {
-        traceTunnelEvent(`resource-pack cache hit bytes=${cached.byteLength}`);
-        return acquireCachedResourcePack(cached);
-    }
-    if (stream) {
-        return beginStreamingResourcePack(target, init, maximumBytes, key);
-    }
-    const download = await downloadResourcePackWithRetries(target, init, maximumBytes);
+    let inflight;
     try {
-        throwIfProxyClientDisconnected(init.signal);
+        for (;;) {
+            const now = Date.now();
+            pruneResourcePackCache(now);
+            const cached = resourcePackCache.get(key);
+            if (cached !== undefined && now < cached.expiresAt && !cached.evicted) {
+                traceTunnelEvent(`resource-pack cache hit bytes=${cached.byteLength}`);
+                return acquireCachedResourcePack(cached);
+            }
+            const incumbent = resourcePackInflight.get(key);
+            if (!resourcePackCacheEnabled() || incumbent === undefined) {
+                inflight = resourcePackCacheEnabled()
+                    ? createResourcePackInflight(key)
+                    : undefined;
+                break;
+            }
+            traceTunnelEvent("resource-pack cache wait for in-flight spool");
+            await waitForResourcePackInflight(incumbent, init.signal);
+        }
+        if (stream) {
+            return await beginStreamingResourcePack(target, init, maximumBytes, key, inflight);
+        }
+        const download = await downloadResourcePackWithRetries(target, init, maximumBytes);
+        try {
+            throwIfProxyClientDisconnected(init.signal);
+        }
+        catch (error) {
+            await removeResourcePackTemporaryFile(download.path);
+            throw error;
+        }
+        return await retainCompletedResourcePack(download, key);
     }
-    catch (error) {
-        await removeResourcePackTemporaryFile(download.path);
-        throw error;
+    finally {
+        if (!stream) {
+            settleResourcePackInflight(key, inflight);
+        }
     }
-    return retainCompletedResourcePack(download, key);
 }
 async function retainCompletedResourcePack(download, key) {
     pruneResourcePackCache();
@@ -3742,7 +3807,7 @@ async function releaseResourcePackDownload(download) {
         await removeResourcePackTemporaryFile(download.path);
     }
 }
-async function beginStreamingResourcePack(target, init, maximumBytes, key) {
+async function beginStreamingResourcePack(target, init, maximumBytes, key, inflight) {
     const timeoutState = createResourcePackTimeoutState(init.signal,
         Date.now() + config.resourcePackStreamOverallTimeoutMs);
     let upstream;
@@ -3758,29 +3823,57 @@ async function beginStreamingResourcePack(target, init, maximumBytes, key) {
         }
         const download = {
             upstream,
-            // Use chunked HTTP until the body has been validated. In particular,
-            // do not expose a guessed length or append retry bytes to a partial ZIP.
+            // Forward the upstream-declared length so reverse proxies do not put a
+            // large response on their slow unknown-length/chunked path. Truncation
+            // still destroys the response and never populates the shared cache.
+            declaredByteLength: declaredLength,
             async streamToResponse(response) {
                 consumed = true;
                 const abort = () => response.destroy();
                 timeoutState.signal.addEventListener("abort", abort, {once: true});
-                let temporary;
+                let spool;
+                let producer;
                 try {
                     timeoutState.signal.throwIfAborted();
-                    temporary = await spoolResponseBody(upstream.body, maximumBytes,
-                        declaredLength, timeoutState.bodyProgress,
-                        (chunk) => writeHttpChunk(response, chunk));
-                    timeoutState.signal.throwIfAborted();
-                    Object.assign(download, await retainCompletedResourcePack(
-                        {upstream, ...temporary}, key));
-                    temporary = undefined;
+                    spool = await createStreamingResourcePackSpool(upstream.body, maximumBytes,
+                        declaredLength, timeoutState.bodyProgress, timeoutState.signal);
+                    producer = (async () => {
+                        try {
+                            const temporary = await spool.producer;
+                            timeoutState.signal.throwIfAborted();
+                            const retained = await retainCompletedResourcePack(
+                                {upstream, ...temporary}, key);
+                            Object.assign(download, retained);
+                            settleResourcePackInflight(key, inflight);
+                            return retained;
+                        }
+                        catch (error) {
+                            spool.fail(error);
+                            settleResourcePackInflight(key, inflight);
+                            throw error;
+                        }
+                    })();
+                    try {
+                        for (;;) {
+                            const chunk = await spool.shift();
+                            if (chunk === undefined) {
+                                break;
+                            }
+                            await writeHttpChunk(response, chunk);
+                        }
+                        await producer;
+                    }
+                    catch (error) {
+                        spool.fail(error);
+                        timeoutState.abort(error);
+                        await producer.catch(() => undefined);
+                        throw error;
+                    }
                 }
                 finally {
                     timeoutState.signal.removeEventListener("abort", abort);
                     timeoutState.dispose();
-                    if (temporary !== undefined) {
-                        await removeResourcePackTemporaryFile(temporary.path);
-                    }
+                    await spool?.dispose(download.path === spool.path);
                 }
             },
             async disposeStream() {
@@ -3788,6 +3881,7 @@ async function beginStreamingResourcePack(target, init, maximumBytes, key) {
                 if (!consumed) {
                     await upstream.body?.cancel().catch(() => undefined);
                 }
+                settleResourcePackInflight(key, inflight);
             },
         };
         return download;
@@ -3798,6 +3892,7 @@ async function beginStreamingResourcePack(target, init, maximumBytes, key) {
             error = new ProxyUpstreamTimeoutError("resource-pack upstream deadline");
         }
         timeoutState.dispose();
+        settleResourcePackInflight(key, inflight);
         throw error;
     }
 }
@@ -3890,6 +3985,11 @@ function createResourcePackTimeoutState(parentSignal, overallDeadline) {
             if (!disposed)
                 armBody();
         },
+        abort(reason) {
+            if (!controller.signal.aborted) {
+                controller.abort(reason);
+            }
+        },
         dispose() {
             if (disposed)
                 return;
@@ -3909,7 +4009,7 @@ function parseResponseContentLength(headers) {
     const parsed = Number(raw);
     return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
-async function spoolResponseBody(body, maximumBytes, declaredLength, onProgress, onChunk) {
+async function spoolResponseBody(body, maximumBytes, declaredLength, onProgress, onChunk, signal) {
     if (declaredLength !== undefined && declaredLength > maximumBytes) {
         throw new ProxyResponseSizeError();
     }
@@ -3926,6 +4026,7 @@ async function spoolResponseBody(body, maximumBytes, declaredLength, onProgress,
     let byteLength = 0;
     try {
         for await (const chunk of body) {
+            signal?.throwIfAborted();
             onProgress?.();
             const buffer = Buffer.isBuffer(chunk)
                 ? chunk
@@ -3947,6 +4048,7 @@ async function spoolResponseBody(body, maximumBytes, declaredLength, onProgress,
                 await onChunk(buffer);
             }
         }
+        signal?.throwIfAborted();
         if (declaredLength !== undefined && byteLength !== declaredLength) {
             throw new ProxyResponseTruncatedError(declaredLength, byteLength);
         }
@@ -3958,6 +4060,119 @@ async function spoolResponseBody(body, maximumBytes, declaredLength, onProgress,
         await removeResourcePackTemporaryFile(path);
         throw error;
     }
+}
+async function createStreamingResourcePackSpool(body, maximumBytes, declaredLength,
+    onProgress, signal) {
+    if (declaredLength !== undefined && declaredLength > maximumBytes) {
+        throw new ProxyResponseSizeError();
+    }
+    if (body === null) {
+        if (declaredLength !== undefined && declaredLength !== 0) {
+            throw new ProxyResponseTruncatedError(declaredLength, 0);
+        }
+        return {
+            path: undefined,
+            producer: Promise.resolve({path: undefined, byteLength: 0}),
+            async shift() { return undefined; },
+            fail() {},
+            async dispose() {},
+        };
+    }
+    const path = join(
+        tmpdir(), `gaius-relay-resource-pack-${process.pid}-${randomUUID()}.tmp`);
+    const file = await open(path, "wx+", 0o600);
+    resourcePackTemporaryPaths.add(path);
+    const waiters = [];
+    let producedBytes = 0;
+    let readOffset = 0;
+    let completed = false;
+    let failure;
+    let disposed = false;
+    const wake = () => {
+        for (const waiter of waiters.splice(0)) {
+            if (failure === undefined) waiter.resolve();
+            else waiter.reject(failure);
+        }
+    };
+    const fail = (error) => {
+        if (failure !== undefined) return;
+        failure = error instanceof Error ? error : new Error(String(error));
+        wake();
+    };
+    const producer = (async () => {
+        try {
+            for await (const chunk of body) {
+                signal?.throwIfAborted();
+                onProgress?.();
+                const buffer = Buffer.isBuffer(chunk)
+                    ? chunk
+                    : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+                if (producedBytes + buffer.byteLength > maximumBytes) {
+                    throw new ProxyResponseSizeError();
+                }
+                let offset = 0;
+                while (offset < buffer.byteLength) {
+                    const result = await file.write(buffer, offset,
+                        buffer.byteLength - offset, producedBytes + offset);
+                    if (result.bytesWritten < 1) {
+                        throw new Error("Resource-pack temporary file stopped accepting data");
+                    }
+                    offset += result.bytesWritten;
+                }
+                producedBytes += buffer.byteLength;
+                wake();
+            }
+            signal?.throwIfAborted();
+            if (declaredLength !== undefined && producedBytes !== declaredLength) {
+                throw new ProxyResponseTruncatedError(declaredLength, producedBytes);
+            }
+            completed = true;
+            wake();
+            return {path, byteLength: producedBytes};
+        }
+        catch (error) {
+            fail(error);
+            completed = true;
+            await file.close().catch(() => undefined);
+            disposed = true;
+            await removeResourcePackTemporaryFile(path);
+            throw error;
+        }
+    })();
+    return {
+        path,
+        producer,
+        async shift() {
+            while (readOffset >= producedBytes) {
+                if (failure !== undefined) throw failure;
+                if (completed) return undefined;
+                await new Promise((resolve, reject) => waiters.push({resolve, reject}));
+            }
+            const length = Math.min(maximumResourcePackStreamReadBytes,
+                producedBytes - readOffset);
+            const buffer = Buffer.allocUnsafe(length);
+            let offset = 0;
+            while (offset < length) {
+                const result = await file.read(buffer, offset, length - offset,
+                    readOffset + offset);
+                if (result.bytesRead < 1) {
+                    throw new Error("Resource-pack spool stopped yielding completed bytes");
+                }
+                offset += result.bytesRead;
+            }
+            readOffset += length;
+            return buffer;
+        },
+        fail,
+        async dispose(keepFile = false) {
+            if (disposed) return;
+            disposed = true;
+            await file.close().catch(() => undefined);
+            if (!keepFile) {
+                await removeResourcePackTemporaryFile(path);
+            }
+        },
+    };
 }
 async function writeHttpChunk(response, chunk) {
     if (response.destroyed) {
