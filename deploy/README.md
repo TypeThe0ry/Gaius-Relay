@@ -32,6 +32,11 @@ an Internet-facing node.
   running target-attestation code, health, and manifest. It supports both a
   systemd Node listener and a Docker-published listener whose docker-proxy cwd
   is `/`.
+- verify-public-origin.sh: read-only public CORS check for the GitHub Pages
+  origin and downloaded `file://` clients. It fails when the deployed
+  `GAIUS_ALLOWED_ORIGINS` omits either origin.
+- relay-example.env.example: checked-in, non-secret values for the current
+  `example.com` + `example.com` deployment.
 
 The registry lease write endpoint /relay-registry/v1/nodes/ is intentionally not
 proxied by the Nginx example. If a registry is used, expose its read-only
@@ -177,6 +182,30 @@ Internet-facing entry point.
 The public smoke is a separate acceptance test because it requires a reachable
 Java server and a deployed public URL. It must be run only against targets the
 operator is authorized to test.
+
+## GitHub Pages origin and TLS hostname
+
+For the canonical hosted client, the RelayNode environment must include both
+the Pages origin and the downloaded-file origin:
+
+    # Use deploy/relay-example.env.example as the source for this live node.
+    GAIUS_ALLOWED_ORIGINS=https://example.com,null
+
+After changing `/etc/gaius/relaynode.env`, restart the RelayNode and run the
+read-only check from this directory:
+
+    sudo systemctl restart gaius-relaynode.service
+    GAIUS_VERIFY_BASE_URL=https://example.com \
+      GAIUS_VERIFY_PAGES_ORIGIN=https://example.com \
+      GAIUS_VERIFY_FILE_ORIGIN=null \
+      bash deploy/verify-public-origin.sh
+
+The browser-facing endpoint is the DNS/TLS name `wss://example.com/tunnel`.
+Do not put the origin IP (`wss://8.219.11.175/tunnel`) in a client query or
+registry: the certificate is issued to the DNS name, so an IP URL fails Chrome
+TLS verification before the RelayNode can receive the request. If a client
+currently contains the IP URL, replace it with the DNS URL and rerun the
+Chrome/CDP gate.
 
 ## systemd and Nginx
 
