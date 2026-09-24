@@ -14,8 +14,6 @@ const reserve = () => new Promise((resolve, reject) => {
   server.listen(0, host, () => resolve({server, port: server.address().port}));
 });
 const fixture = await reserve();
-const tempPrefix = "gaius-relay-resource-pack-";
-const tempBefore = new Set((await readdir(tmpdir())).filter((name) => name.startsWith(tempPrefix)));
 const bridgePort = await reserve();
 await new Promise((resolve) => bridgePort.server.close(resolve));
 let retrySlowAttempts = 0;
@@ -98,8 +96,11 @@ try {
   const idleResponse = await fetch(idleUrl, {headers: {origin}});
   assert.equal(idleResponse.status, 504);
   assert.equal(idleResponse.headers.get("access-control-allow-origin"), origin);
-  const tempAfter = (await readdir(tmpdir())).filter((name) => name.startsWith(tempPrefix));
-  assert.deepEqual(tempAfter.filter((name) => !tempBefore.has(name)), [],
+  // Other Relay smoke tests may run concurrently in the shared OS temp directory.
+  // Assert cleanup for this child only; all files from this fresh PID belong to this test.
+  const tempAfter = (await readdir(tmpdir())).filter((name) =>
+    name.startsWith(`gaius-relay-resource-pack-${bridge.pid}-`));
+  assert.deepEqual(tempAfter, [],
     "timeout paths leaked a resource-pack temporary file");
   console.log("resource-pack-timeout-smoke: PASS");
 } finally {
