@@ -4270,6 +4270,7 @@ function createUpstreamHeaders(request, proxyKind) {
             "x-minecraft-uuid",
             "x-minecraft-version",
             "x-minecraft-version-id",
+            "range",
         ];
     }
     for (const name of allowed) {
@@ -4277,6 +4278,15 @@ function createUpstreamHeaders(request, proxyKind) {
         if (typeof value === "string") {
             headers.set(name, value);
         }
+    }
+    if (proxyKind === "resource-pack") {
+        // JihuLab/CDN edges can select a slow compressed transfer when the
+        // relay omits these headers. Resource packs are already ZIP files;
+        // request the byte stream verbatim and preserve an optional range so
+        // retries and diagnostic probes do not restart a transformed body.
+        headers.set("accept", "application/octet-stream,*/*");
+        headers.set("accept-encoding", "identity");
+        headers.set("user-agent", "Gaius-RelayNode/0.2.1");
     }
     if (proxyKind === "realms") {
         const cookie = request.headers["x-gaius-realms-cookie"];

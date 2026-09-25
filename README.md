@@ -24,7 +24,7 @@ GAIUS_RESOURCE_PACK_CACHE_ENTRIES=64 \
 GAIUS_RESOURCE_PACK_HEADERS_TIMEOUT_MS=15000 \
 GAIUS_RESOURCE_PACK_BODY_IDLE_TIMEOUT_MS=15000 \
 GAIUS_RESOURCE_PACK_OVERALL_TIMEOUT_MS=110000 \
-GAIUS_RESOURCE_PACK_STREAM_OVERALL_TIMEOUT_MS=300000 \
+GAIUS_RESOURCE_PACK_STREAM_OVERALL_TIMEOUT_MS=600000 \
 GAIUS_RELAY_NODE_NAME='Example RelayNode' \
 npm start
 ```
@@ -73,7 +73,7 @@ upstream headers, body-idle, and complete-download deadlines are controlled by
 `GAIUS_RESOURCE_PACK_BODY_IDLE_TIMEOUT_MS`, and
 `GAIUS_RESOURCE_PACK_OVERALL_TIMEOUT_MS` (buffered requests, default 110 seconds),
 and `GAIUS_RESOURCE_PACK_STREAM_OVERALL_TIMEOUT_MS` (streaming requests, default
-300 seconds, maximum 600 seconds). Headers and idle timeouts still apply to
+600 seconds, maximum 600 seconds). Headers and idle timeouts still apply to
 streaming requests, including clients stalled by backpressure. A timeout before
 headers returns a CORS `504`; after response data starts, it closes the incomplete
 stream. Streaming requires the updated RelayNode deployment; older nodes ignore
