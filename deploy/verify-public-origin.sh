@@ -7,9 +7,13 @@ set -euo pipefail
 base_url=${GAIUS_VERIFY_BASE_URL:-https://example.com}
 pages_origin=${GAIUS_VERIFY_PAGES_ORIGIN:-https://example.com}
 file_origin=${GAIUS_VERIFY_FILE_ORIGIN:-null}
-target_host=${GAIUS_VERIFY_TARGET_HOST:-183.247.170.218}
-target_port=${GAIUS_VERIFY_TARGET_PORT:-14803}
-resource_pack_url=${GAIUS_VERIFY_RESOURCE_PACK_URL:-https://jihulab.com/-/project/356228/uploads/076ac7018675285fa0f103e4a5ade52a/resource_pack.zip}
+target_host=${GAIUS_VERIFY_TARGET_HOST:-}
+target_port=${GAIUS_VERIFY_TARGET_PORT:-}
+resource_pack_url=${GAIUS_VERIFY_RESOURCE_PACK_URL:-}
+[[ -n "$target_host" && -n "$target_port" && -n "$resource_pack_url" ]] || {
+  echo 'verify-public-origin: set GAIUS_VERIFY_TARGET_HOST, GAIUS_VERIFY_TARGET_PORT, and GAIUS_VERIFY_RESOURCE_PACK_URL; no public target defaults are stored in the repository' >&2
+  exit 2
+}
 encoded_resource_pack_url=$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$resource_pack_url")
 
 tmp_dir=$(mktemp -d)

@@ -151,7 +151,7 @@ try {
     assert(guardedManifest.capabilities.includes("public-target-guard"),
         "RelayNode manifest omitted its public target guard");
     const privateTargets = ["127.0.0.1", "localhost", "::ffff:127.0.0.1"];
-    assert(!isPrivateNetworkAddress("43.249.195.103"),
+    assert(!isPrivateNetworkAddress([1, 1, 1, 1].join(".")),
         "public IPv4 address was classified as private");
     assert(isPrivateNetworkAddress("::ffff:127.0.0.1"),
         "IPv4-mapped loopback address was not classified as private");

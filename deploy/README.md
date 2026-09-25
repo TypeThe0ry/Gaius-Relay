@@ -201,11 +201,12 @@ read-only check from this directory:
       bash deploy/verify-public-origin.sh
 
 The browser-facing endpoint is the DNS/TLS name `wss://example.com/tunnel`.
-Do not put the origin IP (`wss://8.219.11.175/tunnel`) in a client query or
-registry: the certificate is issued to the DNS name, so an IP URL fails Chrome
-TLS verification before the RelayNode can receive the request. If a client
-currently contains the IP URL, replace it with the DNS URL and rerun the
-Chrome/CDP gate.
+Do not put the origin IP in a client query, registry, README, or release
+artifact. Keep the origin address only in the private DNS/provider configuration;
+the browser must use the TLS DNS name from `GAIUS_RELAY_PUBLIC_URL`. An IP URL
+also fails Chrome certificate validation before the RelayNode can receive the
+request. If an old client contains an IP URL, replace it with the DNS URL and
+rerun the Chrome/CDP gate.
 
 ## systemd and Nginx
 
