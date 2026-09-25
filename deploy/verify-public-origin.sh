@@ -9,7 +9,7 @@ pages_origin=${GAIUS_VERIFY_PAGES_ORIGIN:-https://example.com}
 file_origin=${GAIUS_VERIFY_FILE_ORIGIN:-null}
 target_host=${GAIUS_VERIFY_TARGET_HOST:-183.247.170.218}
 target_port=${GAIUS_VERIFY_TARGET_PORT:-14803}
-resource_pack_url=${GAIUS_VERIFY_RESOURCE_PACK_URL:-https://jihulab.com/-/project/356228/uploads/e0bbd28e09b44deb0d1d60cc46c137b0/resource_pack.zip}
+resource_pack_url=${GAIUS_VERIFY_RESOURCE_PACK_URL:-https://jihulab.com/-/project/356228/uploads/076ac7018675285fa0f103e4a5ade52a/resource_pack.zip}
 encoded_resource_pack_url=$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$resource_pack_url")
 
 tmp_dir=$(mktemp -d)
