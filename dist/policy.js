@@ -56,16 +56,42 @@ export function parseConnectRequest(text) {
         typeof candidate.token !== "string") {
         throw new TypeError("Connect token must be a string");
     }
+    const skinDescriptor = parseSkinDescriptor(candidate.skinDescriptor);
     const host = normalizeConnectHost(candidate.host, candidate.port);
     if (host.length === 0 || (isIP(host) === 0 && !isValidDnsName(host))) {
         throw new TypeError("Connect host is not a valid IP address or DNS name");
+    }
+    if (skinDescriptor !== undefined &&
+        !/^(?:client|server|lan-server)-[0-9a-f]{32}\.gaius-local$/u.test(host)) {
+        throw new TypeError("Skin descriptor is only valid for a LAN tunnel");
     }
     return {
         type: "connect",
         host,
         port: candidate.port,
         ...(candidate.token === undefined ? {} : { token: candidate.token }),
+        ...(skinDescriptor === undefined ? {} : { skinDescriptor }),
     };
+}
+function parseSkinDescriptor(value) {
+    if (value === undefined) {
+        return undefined;
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new TypeError("Skin descriptor must be an object");
+    }
+    const uuid = typeof value.uuid === "string" ? value.uuid.trim().toLowerCase() : "";
+    const username = typeof value.username === "string" ? value.username : "";
+    const textureValue = typeof value.value === "string" ? value.value : "";
+    const signature = value.signature === undefined
+        ? ""
+        : typeof value.signature === "string" ? value.signature : null;
+    if (!/^[0-9a-f]{32}$/u.test(uuid) || username.length < 1 || username.length > 16 ||
+        textureValue.length < 1 || textureValue.length > 16384 || signature === null ||
+        signature.length > 16384) {
+        throw new TypeError("Skin descriptor is invalid or exceeds its size limit");
+    }
+    return { uuid, username, value: textureValue, signature };
 }
 function normalizeConnectHost(host, port) {
     const value = host.trim().toLowerCase();

@@ -66,6 +66,11 @@ const maximumClientFrameParserBytes = 16 * 1024 * 1024 + 5;
 const maximumMinecraftHandshakeBytes = 4 * 1024;
 const resourcePackBodyAttempts = 3;
 const localTunnelWaitMs = 10 * 60 * 1000;
+// The integrated server can emit its first login bytes before the joiner has
+// completed the relay handshake. Keep that short race lossless while keeping
+// the unauthenticated pre-pair buffer bounded.
+const maximumLocalPrePairFrames = 256;
+const maximumLocalPrePairBytes = 8 * 1024 * 1024;
 const relayCapabilities = [
     "tcp-tunnel",
     "ephemeral-tunnel-lease",
@@ -2033,6 +2038,7 @@ webSocketServer.on("connection", (webSocket) => {
             }
             const localTunnel = parseLocalTunnelHost(request.host);
             if (localTunnel !== undefined) {
+                localTunnel.skinDescriptor = request.skinDescriptor;
                 clearInterval(idleTimer);
                 registerLocalTunnel(webSocket, localTunnel, closeBoth);
                 return;
@@ -3045,11 +3051,11 @@ function tokenMatches(supplied, expected) {
         timingSafeEqual(suppliedBytes, expectedBytes));
 }
 function parseLocalTunnelHost(host) {
-    const match = /^(client|server)-([a-f0-9]{32})\.gaius-local$/u.exec(host);
+    const match = /^(client|server|lan-server)-([a-f0-9]{32})\.gaius-local$/u.exec(host);
     if (match === null) {
         return undefined;
     }
-    return { role: match[1], sessionId: match[2] };
+    return { role: match[1] === "lan-server" ? "server" : match[1], sessionId: match[2], host };
 }
 function registerLocalTunnel(webSocket, request, closeSelf) {
     let session = localTunnelSessions.get(request.sessionId);
@@ -3071,13 +3077,17 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
     const endpoint = {
         webSocket,
         role: request.role,
+        host: request.host,
+        skinDescriptor: request.skinDescriptor,
         peer: undefined,
+        pendingFrames: [],
+        pendingBytes: 0,
         closed: false,
         flowPaused: false,
         backpressurePaused: false,
     };
     session[request.role] = endpoint;
-    const removeEndpoint = () => {
+    const removeEndpoint = (code, reason) => {
         if (endpoint.closed) {
             return;
         }
@@ -3111,11 +3121,11 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
     };
     webSocket.on("message", (data, binary) => {
         const peer = endpoint.peer;
-        if (peer === undefined || peer.closed || peer.webSocket.readyState !== WebSocket.OPEN) {
-            closeSelf(1003, "Local tunnel is not connected");
-            return;
-        }
         if (!binary) {
+            if (peer === undefined || peer.closed || peer.webSocket.readyState !== WebSocket.OPEN) {
+                closeSelf(1003, "Local tunnel is not connected");
+                return;
+            }
             try {
                 const message = JSON.parse(toBuffer(data).toString("utf8"));
                 if (message?.type !== "flow" || typeof message.paused !== "boolean") {
@@ -3136,6 +3146,16 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
             return;
         }
         const bytes = toBuffer(data);
+        if (peer === undefined || peer.closed || peer.webSocket.readyState !== WebSocket.OPEN) {
+            if (endpoint.pendingFrames.length >= maximumLocalPrePairFrames ||
+                endpoint.pendingBytes + bytes.byteLength > maximumLocalPrePairBytes) {
+                closeSelf(1009, "Local tunnel pre-pair buffer exceeded");
+                return;
+            }
+            endpoint.pendingFrames.push(bytes);
+            endpoint.pendingBytes += bytes.byteLength;
+            return;
+        }
         peer.webSocket.send(bytes, { binary: true }, (error) => {
             if (error) {
                 closeLocalTunnelSession(request.sessionId, 1011, "Local tunnel send failed");
@@ -3152,14 +3172,52 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
             updateLocalReadState(endpoint);
         }
     });
-    webSocket.once("close", removeEndpoint);
+    webSocket.once("close", (code, reason) => removeEndpoint(code, reason));
     webSocket.once("error", removeEndpoint);
     if (session.client !== undefined && session.server !== undefined) {
         clearTimeout(session.timeout);
         session.client.peer = session.server;
         session.server.peer = session.client;
-        session.client.webSocket.send(JSON.stringify({ type: "connected" }));
-        session.server.webSocket.send(JSON.stringify({ type: "connected" }));
+        // Local tunnels still pass through the normal RelayNode client
+        // attestation check.  Report the exact logical target represented by
+        // each endpoint instead of the old unqualified control message.
+        session.client.webSocket.send(JSON.stringify({
+            type: "connected",
+            host: `client-${request.sessionId}.gaius-local`,
+            port: 25565,
+        }));
+        session.server.webSocket.send(JSON.stringify({
+            type: "connected",
+            host: session.server.host,
+            port: 25565,
+        }));
+        if (session.client.skinDescriptor !== undefined) {
+            session.server.webSocket.send(JSON.stringify({
+                type: "skin",
+                skinDescriptor: session.client.skinDescriptor,
+            }));
+        }
+        if (session.server.skinDescriptor !== undefined) {
+            session.client.webSocket.send(JSON.stringify({
+                type: "skin",
+                skinDescriptor: session.server.skinDescriptor,
+            }));
+        }
+        for (const endpoint of [session.client, session.server]) {
+            const peer = endpoint.peer;
+            if (peer === undefined || peer.closed || peer.webSocket.readyState !== WebSocket.OPEN) {
+                continue;
+            }
+            for (const frame of endpoint.pendingFrames) {
+                peer.webSocket.send(frame, { binary: true }, (error) => {
+                    if (error) {
+                        closeLocalTunnelSession(request.sessionId, 1011, "Local tunnel pre-pair frame failed");
+                    }
+                });
+            }
+            endpoint.pendingFrames = [];
+            endpoint.pendingBytes = 0;
+        }
     }
 }
 function updateLocalReadState(endpoint) {
