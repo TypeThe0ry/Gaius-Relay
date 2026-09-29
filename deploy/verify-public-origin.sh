@@ -37,7 +37,8 @@ curl "${curl_args[@]}" -D "$tmp_dir/pack.headers" -o "$tmp_dir/pack.body" \
   "$base_url/proxy/resource-pack?url=$encoded_resource_pack_url&stream=1"
 
 header_value() {
-  awk -F': *' -v wanted="$1" 'tolower($1) == tolower(wanted) {sub(/[\r\n]+$/, "", $2); print $2; exit}' "$2"
+  # Only the first colon separates the name; origins such as https://host keep theirs.
+  awk -v wanted="$1" '{name = $0; sub(/:.*/, "", name)} tolower(name) == tolower(wanted) {value = $0; sub(/^[^:]*: */, "", value); sub(/[\r\n]+$/, "", value); print value; exit}' "$2"
 }
 
 pages_allow=$(header_value access-control-allow-origin "$tmp_dir/pages.headers")
