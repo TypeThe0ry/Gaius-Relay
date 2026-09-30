@@ -1,9 +1,14 @@
 // The RelayNode only needs a small, versioned view of the Minecraft wire
 // protocol. Keep this module local to the bridge image: the Docker build
 // intentionally copies apps/bridge/dist without the browser/client packages.
-// Packet ids below are the play/configuration ids for the corresponding
-// protocol profile; login and configuration packet ids are unchanged between
-// 1.21.11 (774) and 26.2 (776).
+//
+// Packet ids are the ProtocolInfoBuilder registration order in each profile's
+// client archive (GameProtocols/ConfigurationProtocols/LoginProtocols), checked
+// against the vanilla data generator's reports/packets.json for the same archive.
+// Never derive a new profile's table from an older one: 26.3 (777) inserted
+// post_effects into CONFIGURATION and three clientbound PLAY packets, so its
+// ids differ from 26.2 (776) even where the packet names match. LOGIN ids are
+// unchanged across 1.21.11 (774), 26.2 (776) and 26.3 (777).
 
 const commonLoginIds = Object.freeze({
     clientboundDisconnect: 0,
@@ -15,6 +20,7 @@ const commonLoginIds = Object.freeze({
     serverboundLoginAcknowledged: 3,
 });
 
+// CONFIGURATION ids shared by 1.21.11 (774) and 26.2 (776).
 const commonConfigurationIds = Object.freeze({
     clientboundDisconnect: 2,
     clientboundFinish: 3,
@@ -33,12 +39,32 @@ const commonConfigurationIds = Object.freeze({
     serverboundAcceptCodeOfConduct: 9,
 });
 
-function profile(name, protocolVersion, play) {
+// 26.3 (777) registers clientbound post_effects at CONFIGURATION id 10, which
+// moves every later clientbound id up by one. Serverbound ids are unchanged.
+const configurationIds26_3 = Object.freeze({
+    clientboundDisconnect: 2,
+    clientboundFinish: 3,
+    clientboundKeepAlive: 4,
+    clientboundPing: 5,
+    clientboundKnownPacks: 15,
+    clientboundResourcePackPush: 9,
+    clientboundShowDialog: 19,
+    clientboundCodeOfConduct: 20,
+    serverboundFinish: 3,
+    serverboundKeepAlive: 4,
+    serverboundPong: 5,
+    serverboundSelectKnownPacks: 7,
+    serverboundResourcePack: 6,
+    serverboundCustomClickAction: 8,
+    serverboundAcceptCodeOfConduct: 9,
+});
+
+function profile(name, protocolVersion, play, configuration = commonConfigurationIds) {
     return Object.freeze({
         name,
         protocolVersion,
         login: commonLoginIds,
-        configuration: commonConfigurationIds,
+        configuration,
         play: Object.freeze(play),
     });
 }
@@ -87,10 +113,41 @@ export const MINECRAFT_26_2 = profile("26.2", 776, {
     serverboundConfigurationAcknowledged: 16,
 });
 
-const byVersion = new Map([
-    [MINECRAFT_1_21_11.protocolVersion, MINECRAFT_1_21_11],
-    [MINECRAFT_26_2.protocolVersion, MINECRAFT_26_2],
+// 26.3 PLAY clientbound adds add_transient_block (37), post_effects (83) and
+// swing_animation (123). PLAY serverbound replaces swing (26.2 id 63) with
+// punch (46); none of the serverbound ids listed here moved.
+export const MINECRAFT_26_3 = profile("26.3", 777, {
+    clientboundChunkBatchFinished: 11,
+    clientboundChunkBatchStart: 12,
+    clientboundCustomPayload: 24,
+    clientboundDisconnect: 32,
+    clientboundKeepAlive: 45,
+    clientboundPing: 62,
+    clientboundLogin: 50,
+    clientboundChunk: 46,
+    clientboundSetChunkCacheCenter: 96,
+    clientboundSetChunkCacheRadius: 97,
+    clientboundSetSimulationDistance: 113,
+    clientboundStartConfiguration: 120,
+    serverboundCustomPayload: 22,
+    serverboundChunkBatchReceived: 11,
+    serverboundKeepAlive: 28,
+    serverboundPong: 45,
+    serverboundPlayerLoaded: 44,
+    serverboundClientTickEnd: 13,
+    serverboundConfigurationAcknowledged: 16,
+}, configurationIds26_3);
+
+// Every profile the RelayNode frames, in ascending protocol order. Any other
+// protocol version stays an opaque byte tunnel (no profile is resolved).
+export const MINECRAFT_PROFILES = Object.freeze([
+    MINECRAFT_1_21_11,
+    MINECRAFT_26_2,
+    MINECRAFT_26_3,
 ]);
+
+const byVersion = new Map(
+    MINECRAFT_PROFILES.map((candidate) => [candidate.protocolVersion, candidate]));
 
 export function resolveMinecraftProfile(protocolVersion) {
     return byVersion.get(protocolVersion);
