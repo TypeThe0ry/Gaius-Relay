@@ -147,7 +147,8 @@ security requirements.
 
 By default, the RelayNode replies to exact unencrypted keepalive frames while
 the browser is busy reloading a server resource pack. It selects the packet
-table from the initial Minecraft handshake for 1.21.11 (774) or 26.2 (776),
+table from the initial Minecraft handshake for 1.21.11 (774), 26.2 (776) or
+26.3 (777),
 then emits the profile-specific payloadless client tick after configuration
 enters PLAY and replays the client's exact tick frame while the browser is
 stalled. The relay tracks the reversible `PLAY -> CONFIGURATION -> PLAY`
@@ -163,8 +164,17 @@ Run the focused protocol test with:
 ```sh
 GAIUS_SMOKE_MINECRAFT_VERSION=1.21.11 npm run smoke
 GAIUS_SMOKE_MINECRAFT_VERSION=26.2 npm run smoke
+GAIUS_SMOKE_MINECRAFT_VERSION=26.3 npm run smoke
 npm run smoke:profiles
 ```
+
+The per-profile packet ids in `dist/protocol.js` come from each profile's
+client archive. After
+`GAIUS_VERSION_PROFILE_PATH=versions/<id>.json ./port/scripts/fetch-version.sh`, run
+`node tools/gen-protocol-ids.mjs --profile <id>` from the repository root: it
+runs the data generator bundled in the SHA-1-verified archive and fails on any id
+that differs from `dist/protocol.js` or the singleplayer Worker smoke tables.
+Never copy a table from an older profile by hand.
 
 Run the standalone full browser-transport path against an unmodified local
 vanilla server and the local RelayNode with:
@@ -389,8 +399,8 @@ any PLAY tick injected before configuration finishes. Set
 `GAIUS_SMOKE_PLAY_SOAK_MS=60000` with `GAIUS_SMOKE_MINECRAFT_HOST` to keep a
 real server connection alive and validate any server-initiated reconfiguration.
 The protocol fixture defaults to Minecraft `1.21.11` (protocol `774`); set
-`GAIUS_SMOKE_MINECRAFT_VERSION=26.2` (or `776`) to exercise the 26.2 packet
-table. RelayNode selects the same table from each client's initial handshake,
+`GAIUS_SMOKE_MINECRAFT_VERSION=26.2` (or `776`) or `26.3` (or `777`) to exercise
+that profile's packet table. RelayNode selects the same table from each client's initial handshake,
 so one node can carry either supported version without a global setting.
 The optional public-server path also understands supported vanilla server
 dialogs and Code of Conduct confirmation before entering PLAY. Prompt handling

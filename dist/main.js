@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { WebSocket, WebSocketServer, } from "ws";
 import { loadConfig } from "./config.js";
 import { isHostAllowed, isOriginAllowed, isPrivateNetworkAddress, normalizeHost, parseConnectRequest, } from "./policy.js";
-import { resolveMinecraftProfile } from "./protocol.js";
+import { MINECRAFT_PROFILES, resolveMinecraftProfile } from "./protocol.js";
 import { MinecraftFrameAccumulator } from "./framed-stream.js";
 const config = loadConfig();
 const traceTunnel = process.env.GAIUS_TRACE_TUNNEL === "1";
@@ -468,16 +468,33 @@ function runClientFrameReadyQueue() {
 // Keep this telemetry process-wide, scalar-only and saturating. RelayNode
 // operators need to prove which profile/phase was proxied without retaining a
 // KeepAlive value, packet bytes, encryption material, or an unbounded event log.
+// The per-profile buckets are derived once from the static relay profile
+// table, so the scalar set stays fixed for a given build. A new profile only
+// adds its own profilesSelected<protocol> and proxiedKeepAlives<protocol>*
+// buckets; existing names and their counting semantics never change.
+const keepAliveProfileCounters = new Map(MINECRAFT_PROFILES.map((profile) => [
+    profile.protocolVersion,
+    Object.freeze({
+        selected: `profilesSelected${profile.protocolVersion}`,
+        configuration: `proxiedKeepAlives${profile.protocolVersion}Configuration`,
+        play: `proxiedKeepAlives${profile.protocolVersion}Play`,
+    }),
+]));
+function keepAliveProfileCounterFields(kinds, source) {
+    const fields = {};
+    for (const names of keepAliveProfileCounters.values()) {
+        for (const kind of kinds) {
+            fields[names[kind]] = source === undefined ? 0 : source[names[kind]];
+        }
+    }
+    return fields;
+}
 const keepAliveProxyTelemetry = {
     schemaVersion: 2,
     enabled: config.proxyKeepAlives,
-    profilesSelected774: 0,
-    profilesSelected776: 0,
+    ...keepAliveProfileCounterFields(["selected"]),
     proxiedKeepAlives: 0,
-    proxiedKeepAlives774Configuration: 0,
-    proxiedKeepAlives774Play: 0,
-    proxiedKeepAlives776Configuration: 0,
-    proxiedKeepAlives776Play: 0,
+    ...keepAliveProfileCounterFields(["configuration", "play"]),
     lastAt: 0,
     maxGapMillis: 0,
     writeBackpressure: 0,
@@ -612,11 +629,9 @@ function incrementKeepAliveProxyCounter(name) {
 }
 
 function recordKeepAliveProfileSelection(profile) {
-    if (profile.protocolVersion === 774) {
-        incrementKeepAliveProxyCounter("profilesSelected774");
-    }
-    else if (profile.protocolVersion === 776) {
-        incrementKeepAliveProxyCounter("profilesSelected776");
+    const counters = keepAliveProfileCounters.get(profile.protocolVersion);
+    if (counters !== undefined) {
+        incrementKeepAliveProxyCounter(counters.selected);
     }
 }
 
@@ -638,17 +653,10 @@ function recordProxiedKeepAlive(profile, phase) {
     }
     keepAliveProxyTelemetry.lastAt = now;
     incrementKeepAliveProxyCounter("proxiedKeepAlives");
-    const groupedCounter = profile.protocolVersion === 774
-        ? phase === "configuration"
-            ? "proxiedKeepAlives774Configuration"
-            : "proxiedKeepAlives774Play"
-        : profile.protocolVersion === 776
-            ? phase === "configuration"
-                ? "proxiedKeepAlives776Configuration"
-                : "proxiedKeepAlives776Play"
-            : undefined;
-    if (groupedCounter !== undefined) {
-        incrementKeepAliveProxyCounter(groupedCounter);
+    const counters = keepAliveProfileCounters.get(profile.protocolVersion);
+    if (counters !== undefined) {
+        incrementKeepAliveProxyCounter(
+            phase === "configuration" ? counters.configuration : counters.play);
     }
 }
 
@@ -928,15 +936,9 @@ function relayRuntimeSnapshot() {
         activeServerFrameDrainTimers: activeServerFrameDrainHandles,
         keepAliveProxy: { ...keepAliveProxyTelemetry },
         keepAliveProxyEnabled: keepAliveProxyTelemetry.enabled,
-        profilesSelected774: keepAliveProxyTelemetry.profilesSelected774,
-        profilesSelected776: keepAliveProxyTelemetry.profilesSelected776,
+        ...keepAliveProfileCounterFields(["selected"], keepAliveProxyTelemetry),
         proxiedKeepAlives: keepAliveProxyTelemetry.proxiedKeepAlives,
-        proxiedKeepAlives774Configuration:
-            keepAliveProxyTelemetry.proxiedKeepAlives774Configuration,
-        proxiedKeepAlives774Play: keepAliveProxyTelemetry.proxiedKeepAlives774Play,
-        proxiedKeepAlives776Configuration:
-            keepAliveProxyTelemetry.proxiedKeepAlives776Configuration,
-        proxiedKeepAlives776Play: keepAliveProxyTelemetry.proxiedKeepAlives776Play,
+        ...keepAliveProfileCounterFields(["configuration", "play"], keepAliveProxyTelemetry),
         proxiedKeepAliveLastAt: keepAliveProxyTelemetry.lastAt,
         proxiedKeepAliveMaxGapMillis: keepAliveProxyTelemetry.maxGapMillis,
         keepAliveProxyWriteBackpressure: keepAliveProxyTelemetry.writeBackpressure,
@@ -1022,6 +1024,9 @@ function relayRuntimeSnapshot() {
 }
 const allowedAuthHosts = new Set([
     "api.minecraftservices.com",
+    // authlib 10 (26.3) resolves every service endpoint through this
+    // discovery document before it contacts the hosts below.
+    "discovery.minecraftservices.com",
     "api.mojang.com",
     "sessionserver.mojang.com",
 ]);
@@ -2516,7 +2521,7 @@ webSocketServer.on("connection", (webSocket) => {
                         if (handshakeResult.state === "raw") {
                             // A non-Minecraft preamble is an opaque stream decision.
                             // End the one-shot probe so a later byte sequence cannot
-                            // be promoted into a 774/776 profile handshake.
+                            // be promoted into a supported profile handshake.
                             minecraftHandshakeSeen = true;
                             minecraftHandshakeBuffer = Buffer.alloc(0);
                             transitionKeepAliveProxyToOpaque();

@@ -11,6 +11,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { MinecraftFrameAccumulator } from "./dist/framed-stream.js";
+import { MINECRAFT_PROFILES } from "./dist/protocol.js";
 
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 // Keep this in lock-step with main.js: the parser may retain a complete
@@ -24,13 +25,15 @@ const STREAM_PAYLOAD_BYTES = 16 * 1024 * 1024;
 const FRAME_PAYLOAD_BYTES = 8 * 1024;
 const STREAM_FRAME_COUNT = STREAM_PAYLOAD_BYTES / FRAME_PAYLOAD_BYTES;
 const MAX_HANDSHAKE_BYTES = 4 * 1024;
-const SUPPORTED_PROTOCOLS = new Set([774, 776]);
+const SUPPORTED_PROTOCOLS = new Set([774, 776, 777]);
 const TRANSITION_FRAME_ORDINAL = 33;
 const TRANSITION_MODEL_FRAME_COUNT = 40;
 // Keep the recovery model in lock-step with dist/main.js.  A high-water
 // fallback may resume inspection only for a complete, payloadless control
 // packet whose id is selected by the negotiated profile and current phase.
-// Login/configuration ids are shared by 774/776; PLAY ids differ.
+// The serverbound login/configuration ids below are shared by 774/776/777;
+// the PLAY ids differ between 774 and 776/777.  checkProfileIdsMatchRelay()
+// compares this copy with dist/protocol.js so the model cannot drift.
 const HIGH_WATER_PROFILE_IDS = Object.freeze({
     774: Object.freeze({
         loginAcknowledged: 3,
@@ -44,7 +47,33 @@ const HIGH_WATER_PROFILE_IDS = Object.freeze({
         playConfigurationAcknowledged: 16,
         playClientTickEnd: 13,
     }),
+    777: Object.freeze({
+        loginAcknowledged: 3,
+        configurationFinish: 3,
+        playConfigurationAcknowledged: 16,
+        playClientTickEnd: 13,
+    }),
 });
+
+function checkProfileIdsMatchRelay() {
+    const relayProtocols = MINECRAFT_PROFILES.map((profile) => profile.protocolVersion);
+    assertCondition(
+        JSON.stringify([...SUPPORTED_PROTOCOLS]) === JSON.stringify(relayProtocols) &&
+            JSON.stringify(Object.keys(HIGH_WATER_PROFILE_IDS).map(Number)) ===
+                JSON.stringify(relayProtocols),
+        `model profiles ${[...SUPPORTED_PROTOCOLS]} drifted from RelayNode ${relayProtocols}`);
+    for (const profile of MINECRAFT_PROFILES) {
+        const ids = HIGH_WATER_PROFILE_IDS[profile.protocolVersion];
+        const relay = {
+            loginAcknowledged: profile.login.serverboundLoginAcknowledged,
+            configurationFinish: profile.configuration.serverboundFinish,
+            playConfigurationAcknowledged: profile.play.serverboundConfigurationAcknowledged,
+            playClientTickEnd: profile.play.serverboundClientTickEnd,
+        };
+        assertCondition(JSON.stringify(ids) === JSON.stringify(relay),
+            `${profile.name} high-water ids ${JSON.stringify(ids)} != RelayNode ${JSON.stringify(relay)}`);
+    }
+}
 
 function assertCondition(condition, message) {
     if (!condition) {
@@ -1351,6 +1380,12 @@ function testHighWaterRecoveryMatrix() {
         [776, "reconfiguring", "playClientTickEnd"],
         [776, "play", "playConfigurationAcknowledged"],
         [776, "reconfiguring", "playConfigurationAcknowledged"],
+        [777, "login", "loginAcknowledged"],
+        [777, "configuration", "configurationFinish"],
+        [777, "play", "playClientTickEnd"],
+        [777, "reconfiguring", "playClientTickEnd"],
+        [777, "play", "playConfigurationAcknowledged"],
+        [777, "reconfiguring", "playConfigurationAcknowledged"],
     ];
     const summaries = [];
     for (const [protocolVersion, phase, kind] of cases) {
@@ -1922,6 +1957,7 @@ async function assertMainProtocolBranchContract(requireBounded) {
 }
 
 async function selfTest() {
+    checkProfileIdsMatchRelay();
     await testSingleSixteenMiBFrame();
     const fairness = await testMultiFrameFairness();
     const perMessageCounterexample = testPerMessageBurstCounterexample();
