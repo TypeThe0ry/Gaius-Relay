@@ -20,7 +20,9 @@
     "smoke:browser-full-path-artifact": "node browser-full-path-artifact-contract-smoke.mjs",
     "smoke:encryption-request": "node encryption-request-smoke.mjs",
     "smoke:browser-full-path-acceptance": "node browser-full-path-acceptance.mjs",
-    "smoke:external-multiplayer": "node local-relay/scripts/browser-relay-external-multiplayer-smoke.mjs"
+    "smoke:external-multiplayer": "node local-relay/scripts/browser-relay-external-multiplayer-smoke.mjs",
+    "smoke:online-mode-server": "node online-mode-server-smoke.mjs",
+    "smoke:offline-server": "node offline-server-smoke.mjs"
   },
   "dependencies": {
     "ws": "8.21.0"
