@@ -367,6 +367,34 @@ not a call to Mojang. It is not a headed Chrome test: browser DOM,
 Chrome's WebSocket implementation, rendering/event-loop scheduling, and
 TeaVM-generated call boundaries remain outside this check.
 
+To prove a real, unmodified vanilla server end to end, the two server smokes
+download the official `server-artifact.bin` for the active version profile from the
+Mojang manifest (SHA-1 verified against `port/versions/<id>.json`), or take a
+verified archive from `GAIUS_SMOKE_SERVER_archive`, write `eula=true`, and run it on
+a reserved loopback port with Java from `GAIUS_JAVA`/`GAIUS_JAVA_HOME`/`JAVA_HOME`
+(Java 25 for 26.x):
+
+```sh
+GAIUS_VERSION_PROFILE_PATH=versions/26.3.json npm run smoke:online-mode-server
+GAIUS_VERSION_PROFILE_PATH=versions/26.3.json npm run smoke:offline-server
+GAIUS_VERSION_PROFILE_PATH=versions/26.3.json \
+  GAIUS_SMOKE_SERVER_archive=D:/servers/server-26.3.archive \
+  GAIUS_SMOKE_BROWSER_DIST=port/target/26.3/dist npm run smoke:offline-server
+```
+
+`smoke:online-mode-server` keeps `online-mode=true` with a local session-server
+fixture and proves RSA/AES plus session join. `smoke:offline-server` runs the
+server with `online-mode=false` and `white-list=false` (the 26.3 default flips
+the whitelist on), proves the RelayNode LOGIN -> CONFIGURATION -> PLAY path
+with chunk batches through `multiplayer-smoke.mjs`, and, when
+`GAIUS_SMOKE_BROWSER_DIST` names a built client dist, starts its own RelayNode
+and drives the real TeaVM client in headless Chrome through
+`port/scripts/minecraft-263-multiplayer-cdp.mjs` (Direct Connect, PLAY,
+chunks, proxied keepalives, rendered world, disconnect and rejoin). Both share
+`vanilla-server.mjs` for archive verification and the server lifecycle; evidence
+lands under `port/target/<id>/{online-mode,offline-server}-evidence/run-*/`
+(`GAIUS_SMOKE_EVIDENCE_DIRECTORY` overrides it).
+
 Verify the public node separately against a real Java server without making
 external network availability a CI requirement:
 
