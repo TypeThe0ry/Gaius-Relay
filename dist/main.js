@@ -4349,7 +4349,7 @@ function createUpstreamHeaders(request, proxyKind) {
         // retries and diagnostic probes do not restart a transformed body.
         headers.set("accept", "application/octet-stream,*/*");
         headers.set("accept-encoding", "identity");
-        headers.set("user-agent", "Gaius-RelayNode/0.3.1");
+        headers.set("user-agent", "Gaius-RelayNode/0.3.2");
     }
     if (proxyKind === "realms") {
         const cookie = request.headers["x-gaius-realms-cookie"];
