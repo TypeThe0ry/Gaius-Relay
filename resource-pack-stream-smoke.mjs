@@ -17,6 +17,7 @@ const listen = async (server) => {
   return server.address().port;
 };
 const hits = new Map();
+const userAgents = new Set();
 const timers = new Set();
 let finishGated;
 let finishCoalesced;
@@ -28,6 +29,7 @@ const bytes = Buffer.from([80, 75, 3, 4, 0, 255, 27, 10, 99]);
 const fixture = createServer((request, response) => {
   const path = new URL(request.url, `http://${host}`).pathname;
   hits.set(path, (hits.get(path) ?? 0) + 1);
+  userAgents.add(String(request.headers["user-agent"] ?? ""));
   if (path === "/large.zip") {
     response.writeHead(200, {"content-length": String(251 * 1024 * 1024)});
     response.flushHeaders();
@@ -192,6 +194,8 @@ try {
   const cached = await fetch(url("/gated.zip", false), {headers: {origin}});
   assert.deepEqual(Buffer.from(await cached.arrayBuffer()), bytes);
   assert.equal(hits.get("/gated.zip"), 1, "completed stream must populate the shared cache");
+  assert.ok([...userAgents].every((agent) => /^Gaius-RelayNode\/\d+\.\d+\.\d+$/.test(agent)),
+    `resource-pack requests must carry the versioned RelayNode user agent: ${[...userAgents]}`);
 
   for (const username of ["Alice", "Bob", "Alice"]) {
     const result = await request("/cache.zip", {headers: {origin, "x-minecraft-username": username}});
