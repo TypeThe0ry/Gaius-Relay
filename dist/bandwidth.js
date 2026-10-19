@@ -140,11 +140,13 @@ export function createTunnelLimiter(scheduler, meter, options, callbacks) {
     const perConnectionRate = options.perConnectionRate;
     const globalRate = options.globalRate;
     const transferCap = options.transferCap;
-    const enabled = perConnectionRate > 0 || globalRate > 0 || transferCap > 0;
-    const bucket = enabled && perConnectionRate > 0
+    // Accounting is unconditional; only enforcement depends on the limits.
+    // With every limit at zero the limiter counts bytes and never pauses.
+    const enforcing = perConnectionRate > 0 || globalRate > 0 || transferCap > 0;
+    const bucket = perConnectionRate > 0
         ? createTokenBucket(perConnectionRate, perConnectionRate)
         : undefined;
-    const globalBucket = enabled && globalRate > 0
+    const globalBucket = globalRate > 0
         ? options.globalBucket
         : undefined;
     let transferredBytes = 0;
@@ -177,7 +179,7 @@ export function createTunnelLimiter(scheduler, meter, options, callbacks) {
             }
         },
         account(direction, bytes) {
-            if (disposed || !enabled) {
+            if (disposed) {
                 return;
             }
             if (direction === "ingress") {
@@ -214,7 +216,7 @@ export function createTunnelLimiter(scheduler, meter, options, callbacks) {
             }
         },
     };
-    if (enabled) {
+    if (enforcing) {
         scheduler.register(tunnel);
     }
     return tunnel;
