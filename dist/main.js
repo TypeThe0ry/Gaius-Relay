@@ -12,6 +12,7 @@ import { loadConfig } from "./config.js";
 import { isHostAllowed, isOriginAllowed, isPrivateNetworkAddress, normalizeHost, parseConnectRequest, } from "./policy.js";
 import { MINECRAFT_PROFILES, resolveMinecraftProfile } from "./protocol.js";
 import { MinecraftFrameAccumulator } from "./framed-stream.js";
+import { createBandwidthScheduler, createTokenBucket, createTrafficMeter, createTunnelLimiter, } from "./bandwidth.js";
 const config = loadConfig();
 const traceTunnel = process.env.GAIUS_TRACE_TUNNEL === "1";
 const dnsTestScenario = process.env.NODE_ENV === "test"
@@ -32,6 +33,16 @@ let dnsTestSrvAttempts = 0;
 const relayNodeProtocolVersion = 1;
 const relayNodeManifestPath = "/relay-node/v1";
 const relayNodeRuntimePath = "/relay-node/v1.runtime";
+// Shared node-wide rate-limit bucket and the traffic accounting meter. Both
+// are created even when every limit is disabled: the meter only adds integer
+// adds on the tunnel paths, and the scheduler timer is unref'd and short.
+const trafficMeter = createTrafficMeter();
+const bandwidthScheduler = createBandwidthScheduler(trafficMeter);
+const globalBandwidthBucket = config.maximumBandwidthTotal > 0
+    ? createTokenBucket(
+        config.maximumBandwidthTotal,
+        Math.max(config.maximumBandwidthTotal, 64 * 1024))
+    : undefined;
 const maximumResourcePackBytes = 250 * 1024 * 1024;
 // The live resource-pack sender tails the same temporary file that becomes the
 // verified cache entry. Only this fixed read window is held in memory even if a
@@ -89,6 +100,13 @@ const relayCapabilities = [
     "public-target-guard",
     "target-attestation",
     "runtime-telemetry",
+    ...(config.trafficStats ? ["traffic-accounting"] : []),
+    ...(config.maximumBandwidthPerConnection > 0 || config.maximumBandwidthTotal > 0
+        ? ["bandwidth-limits"]
+        : []),
+    ...(config.maximumTransferPerConnection > 0
+        ? ["transfer-limits"]
+        : []),
 ];
 // `ServerboundClientTickEndPacket` is emitted once per client tick. A resource
 // or model reload can temporarily stop browser ticks, while a spawn proxy can
@@ -956,6 +974,14 @@ function relayRuntimeSnapshot() {
         // metadata-only so existing health consumers never receive payload or
         // per-frame records by accident.
         serverFrameTimeline: relayFrameTimelineSnapshot(),
+        traffic: {
+            enabled: config.trafficStats,
+            bandwidthPerConnectionBytesPerSecond:
+                config.maximumBandwidthPerConnection,
+            bandwidthTotalBytesPerSecond: config.maximumBandwidthTotal,
+            transferPerConnectionBytes: config.maximumTransferPerConnection,
+            ...(config.trafficStats ? trafficMeter.snapshot() : {}),
+        },
         // Keep the scalar names easy to consume from existing health probes;
         // their established "sent" spelling means successfully enqueued.
         serverFramesSent: serverFrameTelemetry.enqueuedFrames,
@@ -1109,6 +1135,11 @@ webSocketServer.on("connection", (webSocket) => {
     // duplicate resume callbacks.
     let clientTcpBackpressure = false;
     let clientTcpDrainListener;
+    // Bandwidth rate limits add two more pause reasons on top of the existing
+    // backpressure flags. Ingress (browser -> TCP) pauses the WebSocket read;
+    // egress (TCP -> browser) folds into the TCP read-state condition below.
+    let ingressPausedForBandwidth = false;
+    let tcpPausedForBandwidth = false;
     // A low-water callback must not resume the TCP source until the retained
     // parser remainder has had its own guarded drain turn. This separate hold
     // keeps TCP paused while tcpPausedForWebSocket is cleared for the drain.
@@ -1297,27 +1328,59 @@ webSocketServer.on("connection", (webSocket) => {
         }
         const socket = tcpSocket;
         clientTcpBackpressure = true;
-        webSocket.pause();
+        updateIngressReadState();
         const listener = () => {
             if (clientTcpDrainListener !== listener) {
                 return;
             }
             clientTcpDrainListener = undefined;
             clientTcpBackpressure = false;
-            if (!tunnelCancelled && socket === tcpSocket &&
-                webSocket.readyState === WebSocket.OPEN) {
-                webSocket.resume();
+            if (!tunnelCancelled && socket === tcpSocket) {
+                updateIngressReadState();
             }
         };
         clientTcpDrainListener = listener;
         socket.once("drain", listener);
     };
+    const tunnelBandwidth = createTunnelLimiter(
+        bandwidthScheduler,
+        trafficMeter,
+        {
+            perConnectionRate: config.maximumBandwidthPerConnection,
+            globalRate: config.maximumBandwidthTotal,
+            globalBucket: globalBandwidthBucket,
+            transferCap: config.maximumTransferPerConnection,
+        },
+        {
+            pause: {
+                ingress: () => {
+                    ingressPausedForBandwidth = true;
+                    updateIngressReadState();
+                },
+                egress: () => {
+                    tcpPausedForBandwidth = true;
+                    updateTcpReadState();
+                },
+            },
+            resume: {
+                ingress: () => {
+                    ingressPausedForBandwidth = false;
+                    updateIngressReadState();
+                },
+                egress: () => {
+                    tcpPausedForBandwidth = false;
+                    updateTcpReadState();
+                },
+            },
+            onTransferLimit: () => closeBoth(1009, "Transfer limit exceeded"),
+        });
     const closeBoth = (code, reason) => {
         traceTunnelEvent(`closing tunnel code=${code} reason=${reason}`);
         releaseTunnelLease();
         clearInterval(idleTimer);
         clearClientStallTimer();
         clearClientTcpBackpressure();
+        tunnelBandwidth.dispose();
         tunnelCancelled = true;
         clearServerFrameState();
         clearClientFrameState();
@@ -1333,11 +1396,27 @@ webSocketServer.on("connection", (webSocket) => {
         if (!connected || tcpSocket === undefined) {
             return;
         }
-        if (tcpPausedForWebSocket || tcpPausedForClient || serverFrameDrainHoldingRead) {
+        if (tcpPausedForWebSocket || tcpPausedForClient ||
+            tcpPausedForBandwidth || serverFrameDrainHoldingRead) {
             tcpSocket.pause();
         }
         else {
             tcpSocket.resume();
+        }
+    };
+    // The WebSocket read side has two pause reasons: TCP write backpressure
+    // (armClientTcpBackpressure) and the per-tunnel bandwidth limiter. Route
+    // both through this helper so neither resume can clobber the other.
+    const updateIngressReadState = () => {
+        if (tunnelCancelled ||
+            webSocket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        if (clientTcpBackpressure || ingressPausedForBandwidth) {
+            webSocket.pause();
+        }
+        else {
+            webSocket.resume();
         }
     };
     const countCompleteServerFrames = () => {
@@ -2394,6 +2473,7 @@ webSocketServer.on("connection", (webSocket) => {
                 };
                 tcpSocket.on("data", (chunk) => {
                     serverFrameTelemetry.dataCallbacks++;
+                    tunnelBandwidth.account("egress", chunk.byteLength);
                     if (relayFrameTimelineEnabled) {
                         recordRelayFrameTcpData(
                             relayFrameTimelineState,
@@ -2486,6 +2566,7 @@ webSocketServer.on("connection", (webSocket) => {
                     return;
                 }
                 const clientData = toBuffer(data);
+                tunnelBandwidth.account("ingress", clientData.byteLength);
                 lastClientTrafficAt = Date.now();
                 if (traceTunnel) {
                     traceTunnelEvent(
@@ -3090,13 +3171,48 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
         closed: false,
         flowPaused: false,
         backpressurePaused: false,
+        bandwidthPaused: false,
     };
     session[request.role] = endpoint;
+    const endpointBandwidth = createTunnelLimiter(
+        bandwidthScheduler,
+        trafficMeter,
+        {
+            perConnectionRate: config.maximumBandwidthPerConnection,
+            globalRate: config.maximumBandwidthTotal,
+            globalBucket: globalBandwidthBucket,
+            transferCap: config.maximumTransferPerConnection,
+        },
+        {
+            pause: {
+                ingress: () => {
+                    endpoint.bandwidthPaused = true;
+                    updateLocalReadState(endpoint);
+                },
+                egress: () => {
+                    endpoint.bandwidthPaused = true;
+                    updateLocalReadState(endpoint);
+                },
+            },
+            resume: {
+                ingress: () => {
+                    endpoint.bandwidthPaused = false;
+                    updateLocalReadState(endpoint);
+                },
+                egress: () => {
+                    endpoint.bandwidthPaused = false;
+                    updateLocalReadState(endpoint);
+                },
+            },
+            onTransferLimit: () =>
+                closeLocalTunnelSession(request.sessionId, 1009, "Transfer limit exceeded"),
+        });
     const removeEndpoint = (code, reason) => {
         if (endpoint.closed) {
             return;
         }
         endpoint.closed = true;
+        endpointBandwidth.dispose();
         const current = localTunnelSessions.get(request.sessionId);
         if (current?.[request.role] === endpoint) {
             current[request.role] = undefined;
@@ -3151,6 +3267,7 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
             return;
         }
         const bytes = toBuffer(data);
+        endpointBandwidth.account("ingress", bytes.byteLength);
         if (peer === undefined || peer.closed || peer.webSocket.readyState !== WebSocket.OPEN) {
             if (endpoint.pendingFrames.length >= maximumLocalPrePairFrames ||
                 endpoint.pendingBytes + bytes.byteLength > maximumLocalPrePairBytes) {
@@ -3226,7 +3343,7 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
     }
 }
 function updateLocalReadState(endpoint) {
-    if (endpoint.flowPaused || endpoint.backpressurePaused) {
+    if (endpoint.flowPaused || endpoint.backpressurePaused || endpoint.bandwidthPaused) {
         endpoint.webSocket.pause();
     }
     else {
@@ -3351,6 +3468,7 @@ async function handleHttpRequest(request, response) {
         }
         try {
             body = await readRequestBody(request, maximumRequestBytes);
+            trafficMeter.accountProxy(body.byteLength);
         }
         catch (error) {
             if (error instanceof ProxyRequestSizeError) {
@@ -3453,6 +3571,7 @@ async function handleHttpRequest(request, response) {
         if (responseBody !== null) {
             for await (const chunk of responseBody) {
                 received += chunk.byteLength;
+                trafficMeter.accountProxy(chunk.byteLength);
                 if (received > maximumBytes) {
                     response.destroy(new Error("Proxy response exceeded size limit"));
                     return;
@@ -3555,6 +3674,14 @@ function handleRelayNodeManifest(request, response, requestUrl) {
             bytes: resourcePackCacheBytes,
             maximumBytes: config.maximumResourcePackCacheBytes,
             ttlMs: config.resourcePackCacheMs,
+        },
+        traffic: {
+            enabled: config.trafficStats,
+            bandwidthPerConnectionBytesPerSecond:
+                config.maximumBandwidthPerConnection,
+            bandwidthTotalBytesPerSecond: config.maximumBandwidthTotal,
+            transferPerConnectionBytes: config.maximumTransferPerConnection,
+            ...(config.trafficStats ? trafficMeter.snapshot() : {}),
         },
         runtime: relayRuntimeSnapshot(),
         ...(target === undefined ? {} : { target: targetRouteSnapshot(target) }),

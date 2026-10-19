@@ -20,6 +20,8 @@ const config = {
     allowPrivateNodes: process.env.GAIUS_REGISTRY_ALLOW_PRIVATE_NODES === "1",
     allowTokenProtectedNodes:
         process.env.GAIUS_REGISTRY_ALLOW_TOKEN_PROTECTED_NODES === "1",
+    requireTrafficLimits:
+        process.env.GAIUS_REGISTRY_REQUIRE_TRAFFIC_LIMITS === "1",
 };
 
 const leases = new Map();
@@ -182,6 +184,9 @@ async function verifyRegistration(nodeId, payload) {
     }
     if (manifest.allowsPrivateTargets && !config.allowPrivateNodes) {
         throw new RequestError(400, "Public RelayNodes must block private TCP targets");
+    }
+    if (config.requireTrafficLimits && manifest.traffic?.enabled !== true) {
+        throw new RequestError(400, "RelayNode does not enforce traffic accounting and limits");
     }
     const capabilities = Array.isArray(manifest.capabilities) ? manifest.capabilities : [];
     if (!capabilities.includes("tcp-tunnel")) {
