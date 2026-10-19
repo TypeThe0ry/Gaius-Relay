@@ -20,6 +20,8 @@ const config = {
     allowPrivateNodes: process.env.GAIUS_REGISTRY_ALLOW_PRIVATE_NODES === "1",
     allowTokenProtectedNodes:
         process.env.GAIUS_REGISTRY_ALLOW_TOKEN_PROTECTED_NODES === "1",
+    requireAbuseContact:
+        process.env.GAIUS_REGISTRY_REQUIRE_ABUSE_CONTACT === "1",
 };
 
 const leases = new Map();
@@ -182,6 +184,16 @@ async function verifyRegistration(nodeId, payload) {
     }
     if (manifest.allowsPrivateTargets && !config.allowPrivateNodes) {
         throw new RequestError(400, "Public RelayNodes must block private TCP targets");
+    }
+    if (manifest.abuseContact !== undefined) {
+        const contact = String(manifest.abuseContact);
+        if (!/^mailto:[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(contact) &&
+                !contact.startsWith("https://")) {
+            throw new RequestError(400, "RelayNode abuse contact must be a mailto: address or an https: URL");
+        }
+    }
+    if (config.requireAbuseContact && manifest.abuseContact === undefined) {
+        throw new RequestError(400, "RelayNode manifest does not declare an abuse contact");
     }
     const capabilities = Array.isArray(manifest.capabilities) ? manifest.capabilities : [];
     if (!capabilities.includes("tcp-tunnel")) {
