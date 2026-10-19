@@ -55,13 +55,25 @@ disables each limit). `GAIUS_MAXIMUM_BANDWIDTH_PER_CONNECTION` and
 `GAIUS_MAXIMUM_BANDWIDTH_TOTAL` are token-bucket rate limits that pause the
 tunnel source and resume it on refill, so no tunnel bytes are dropped.
 `GAIUS_MAXIMUM_TRANSFER_PER_CONNECTION` closes a tunnel with close code 1009
-once a single connection exceeds the lifetime byte cap. When
+once a single connection exceeds the lifetime byte cap. Each tunneled byte
+consumes from the per-connection bucket once per direction (browser to
+server and server to browser), so the cap applies to the sum of both
+directions: `GAIUS_MAXIMUM_BANDWIDTH_PER_CONNECTION=8388608` allows roughly
+4 MiB/s each way for a symmetric stream. Bulk throughput is paused and
+resumed on refill while small interactive frames continue to flow, so game
+latency is unaffected even when throttled. When
 `GAIUS_TRAFFIC_STATS` is enabled (the default), the manifest and runtime
 snapshot report live totals and rates under `traffic`, and the manifest
 advertises the `traffic-accounting`, `bandwidth-limits`, and `transfer-limits`
 capabilities. A registry started with
 `GAIUS_REGISTRY_REQUIRE_TRAFFIC_LIMITS=1` rejects RelayNodes whose manifest
 does not enable traffic accounting.
+
+Covered by `npm run smoke:bandwidth` (throttle timing, manifest fields, and
+transfer-cap close code 1009). A reusable benchmark harness lives in
+`relay-bench.mjs`; compare `main` against this branch with
+`node relay-bench.mjs <bridge-dir> <port>` and an optional
+`--per-conn-rate <bytes/s>`.
 
 The client requests `/proxy/resource-pack?stream=1` to receive real resource-pack
 bytes while the upstream download is still in progress. The RelayNode forwards a
