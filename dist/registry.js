@@ -185,10 +185,17 @@ async function verifyRegistration(nodeId, payload) {
     if (manifest.allowsPrivateTargets && !config.allowPrivateNodes) {
         throw new RequestError(400, "Public RelayNodes must block private TCP targets");
     }
-    if (config.requireTrafficLimits && manifest.traffic?.enabled !== true) {
-        throw new RequestError(400, "RelayNode does not enforce traffic accounting and limits");
-    }
     const capabilities = Array.isArray(manifest.capabilities) ? manifest.capabilities : [];
+    if (config.requireTrafficLimits) {
+        const traffic = manifest.traffic;
+        const configuredLimit = Number(traffic?.bandwidthPerConnectionBytesPerSecond) > 0 ||
+            Number(traffic?.bandwidthTotalBytesPerSecond) > 0 ||
+            Number(traffic?.transferPerConnectionBytes) > 0;
+        if (traffic?.enabled !== true || !configuredLimit ||
+                !capabilities.includes("traffic-accounting")) {
+            throw new RequestError(400, "RelayNode does not enforce traffic accounting and limits");
+        }
+    }
     if (!capabilities.includes("tcp-tunnel")) {
         throw new RequestError(400, "RelayNode does not advertise tcp-tunnel capability");
     }

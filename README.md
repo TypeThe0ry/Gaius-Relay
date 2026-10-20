@@ -71,9 +71,9 @@ does not enable traffic accounting.
 
 Covered by `npm run smoke:bandwidth` (throttle timing, manifest fields, and
 transfer-cap close code 1009). A reusable benchmark harness lives in
-`relay-bench.mjs`; compare `main` against this branch with
-`node relay-bench.mjs <bridge-dir> <port>` and an optional
-`--per-conn-rate <bytes/s>`.
+`relay-bench.mjs`; run it with `node relay-bench.mjs <bridge-dir> <port>` and
+an optional `--per-conn-rate <bytes/s>` to record throughput, latency, and CPU
+usage.
 
 The client requests `/proxy/resource-pack?stream=1` to receive real resource-pack
 bytes while the upstream download is still in progress. The RelayNode forwards a
