@@ -185,12 +185,9 @@ async function verifyRegistration(nodeId, payload) {
     if (manifest.allowsPrivateTargets && !config.allowPrivateNodes) {
         throw new RequestError(400, "Public RelayNodes must block private TCP targets");
     }
-    if (manifest.abuseContact !== undefined) {
-        const contact = String(manifest.abuseContact);
-        if (!/^mailto:[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(contact) &&
-                !contact.startsWith("https://")) {
+    if (manifest.abuseContact !== undefined &&
+            !isValidAbuseContact(manifest.abuseContact)) {
             throw new RequestError(400, "RelayNode abuse contact must be a mailto: address or an https: URL");
-        }
     }
     if (config.requireAbuseContact && manifest.abuseContact === undefined) {
         throw new RequestError(400, "RelayNode manifest does not declare an abuse contact");
@@ -204,6 +201,27 @@ async function verifyRegistration(nodeId, payload) {
         throw new RequestError(400, "RelayNode name is invalid");
     }
     return {name, url: publicUrl.href, priority};
+}
+
+function isValidAbuseContact(value) {
+    if (typeof value !== "string") {
+        return false;
+    }
+    const contact = value.trim();
+    if (contact.length === 0 || contact.length > 320 || /[\r\n]/u.test(contact)) {
+        return false;
+    }
+    if (/^mailto:[^\s@<>"'\/?#]+@[^\s@<>"'\/?#]+\.[^\s@<>"'\/?#]+$/u.test(contact)) {
+        return true;
+    }
+    try {
+        const url = new URL(contact);
+        return url.protocol === "https:" && url.hostname.length > 0 &&
+            !url.username && !url.password;
+    }
+    catch {
+        return false;
+    }
 }
 
 async function fetchNodeManifest(url) {

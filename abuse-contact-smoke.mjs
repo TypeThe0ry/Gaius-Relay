@@ -61,6 +61,7 @@ async function fetchManifest(port) {
     const bridge = startNode("dist/main.js", 18840, {
         GAIUS_BRIDGE_PORT: "18840",
         GAIUS_ALLOWED_ORIGINS: "null",
+        GAIUS_ALLOW_NULL_ORIGIN: "1",
         GAIUS_ALLOWED_HOSTS: host,
         GAIUS_BRIDGE_TOKEN: bridgeToken,
         GAIUS_IDLE_TIMEOUT_MS: "60000",
@@ -82,6 +83,7 @@ async function fetchManifest(port) {
     const bridge = startNode("dist/main.js", 18841, {
         GAIUS_BRIDGE_PORT: "18841",
         GAIUS_ALLOWED_ORIGINS: "null",
+        GAIUS_ALLOW_NULL_ORIGIN: "1",
         GAIUS_ALLOWED_HOSTS: host,
         GAIUS_BRIDGE_TOKEN: bridgeToken,
         GAIUS_IDLE_TIMEOUT_MS: "60000",
@@ -103,6 +105,7 @@ async function fetchManifest(port) {
     const bridge = startNode("dist/main.js", 18842, {
         GAIUS_BRIDGE_PORT: "18842",
         GAIUS_ALLOWED_ORIGINS: "null",
+        GAIUS_ALLOW_NULL_ORIGIN: "1",
         GAIUS_ALLOWED_HOSTS: host,
         GAIUS_BRIDGE_TOKEN: bridgeToken,
         GAIUS_IDLE_TIMEOUT_MS: "60000",
@@ -136,6 +139,7 @@ async function fetchManifest(port) {
     const relay = startNode("dist/main.js", relayPort, {
         GAIUS_BRIDGE_PORT: String(relayPort),
         GAIUS_ALLOWED_ORIGINS: "null",
+        GAIUS_ALLOW_NULL_ORIGIN: "1",
         GAIUS_ALLOWED_HOSTS: host,
         GAIUS_BRIDGE_TOKEN: bridgeToken,
         GAIUS_IDLE_TIMEOUT_MS: "60000",
