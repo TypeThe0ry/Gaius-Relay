@@ -10,8 +10,18 @@ const host = "127.0.0.1";
 const origin = "http://127.0.0.1:8781";
 const bridgeToken = "relay-telemetry-runtime-generated-token";
 const directory = fileURLToPath(new URL(".", import.meta.url));
-const bridgePort = 18820;
-const otelPort = 18821;
+
+async function getFreePort() {
+    const probe = createServer();
+    probe.listen(0, host);
+    await once(probe, "listening");
+    const port = probe.address().port;
+    await new Promise((resolve) => probe.close(resolve));
+    return port;
+}
+
+const bridgePort = await getFreePort();
+const otelPort = await getFreePort();
 
 function assert(condition, label) {
     if (!condition) {

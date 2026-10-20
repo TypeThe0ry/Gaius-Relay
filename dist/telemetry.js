@@ -211,16 +211,32 @@ export function createTelemetryListener(collect, listenHost, listenPort) {
 // next interval; a flaky collector must never take the relay down.
 export function createTelemetryExporter(collect, exporterUrl, intervalMs) {
     let stopped = false;
+    let inFlight = false;
     const timer = setInterval(() => {
-        if (stopped) {
+        if (stopped || inFlight) {
             return;
         }
+        inFlight = true;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(),
+            Math.min(10_000, Math.max(1_000, intervalMs)));
         fetch(exporterUrl, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(collect()),
+            signal: controller.signal,
+        }).then(async (response) => {
+            await response.body?.cancel();
+            if (!response.ok) {
+                throw new Error(`collector returned ${response.status}`);
+            }
         }).catch((error) => {
-            console.error("OTLP export failed:", error.message);
+            if (!stopped) {
+                console.error("OTLP export failed:", error.message);
+            }
+        }).finally(() => {
+            clearTimeout(timeout);
+            inFlight = false;
         });
     }, intervalMs);
     timer.unref();

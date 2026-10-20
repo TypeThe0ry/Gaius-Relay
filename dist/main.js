@@ -2769,7 +2769,7 @@ httpServer.listen(config.listenPort, config.listenHost, () => {
 const otelCollector = createTelemetryCollector(
     [
         ["service.name", "gaius-relay-node"],
-        ["service.version", "0.3.3"],
+        ["service.version", "0.4.0"],
         ["gaius.relay.node_id", config.registration?.nodeId ?? "unregistered"],
     ],
     relayMetricProviders(() => relayRuntimeSnapshot()),
@@ -2780,7 +2780,7 @@ function startTelemetry() {
     if (otelPort !== undefined) {
         // Default to loopback: metrics are private and must never be exposed
         // through the public reverse-proxy surface.
-        const listenHost = process.env.GAIUS_OTEL_HOST ?? "127.0.0.1";
+        const listenHost = parseOtelHost(process.env.GAIUS_OTEL_HOST);
         telemetryListener = createTelemetryListener(otelCollector, listenHost, otelPort);
         console.log(
             `Gaius OTel metrics listening on http://${listenHost}:${otelPort}/v1/metrics`);
@@ -2791,6 +2791,14 @@ function startTelemetry() {
         telemetryExporter = createTelemetryExporter(
             otelCollector, otelExporterUrl, intervalMs);
     }
+}
+function parseOtelHost(raw) {
+    const host = raw?.trim() || "127.0.0.1";
+    if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
+        throw new Error(
+            "GAIUS_OTEL_HOST must be a loopback address; expose metrics through a private proxy");
+    }
+    return host;
 }
 function parseOtelExportIntervalMs(raw) {
     const parsed = Number(raw ?? "60000");
