@@ -14,6 +14,7 @@
     "smoke:profiles": "node profile-protocol-smoke.mjs",
     "smoke:public": "node public-relay-smoke.mjs",
     "smoke:bandwidth": "node bandwidth-smoke.mjs",
+    "smoke:abuse-contact": "node abuse-contact-smoke.mjs",
     "smoke:browser-full-path": "node browser-full-path-smoke.mjs",
     "stress:browser-full-path": "node browser-full-path-stress.mjs",
     "smoke:browser-full-path-contract": "node browser-full-path-contract-smoke.mjs",

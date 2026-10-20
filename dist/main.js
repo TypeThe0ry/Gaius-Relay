@@ -3676,6 +3676,9 @@ function handleRelayNodeManifest(request, response, requestUrl) {
         protocolVersion: relayNodeProtocolVersion,
         name: config.relayName,
         tunnelPath: "/tunnel",
+        ...(config.abuseContact === undefined
+            ? {}
+            : { abuseContact: config.abuseContact }),
         tunnelLease: {
             scope: "websocket",
             protocolStreamsShared: false,
