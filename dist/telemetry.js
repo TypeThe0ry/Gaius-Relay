@@ -231,7 +231,12 @@ export function createTelemetryExporter(collect, exporterUrl, intervalMs) {
                 throw new Error(`collector returned ${response.status}`);
             }
         }).catch((error) => {
-            if (!stopped) {
+            // Windows may surface a collector closing an idle keep-alive as a
+            // connection-reset error. It is a failed export, not a relay
+            // failure; the next interval retries it without noisy logging.
+            const connectionReset = error?.code === "ECONNRESET" ||
+                error?.cause?.code === "ECONNRESET";
+            if (!stopped && !connectionReset) {
                 console.error("OTLP export failed:", error.message);
             }
         }).finally(() => {

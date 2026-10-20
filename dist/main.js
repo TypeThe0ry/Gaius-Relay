@@ -1,7 +1,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns";
 import { resolveSrv } from "node:dns/promises";
-import { createReadStream, unlinkSync } from "node:fs";
+import { createReadStream, readFileSync, unlinkSync } from "node:fs";
 import { open, unlink } from "node:fs/promises";
 import { createServer } from "node:http";
 import { connect } from "node:net";
@@ -15,6 +15,7 @@ import { MinecraftFrameAccumulator } from "./framed-stream.js";
 import { createBandwidthScheduler, createTokenBucket, createTrafficMeter, createTunnelLimiter, } from "./bandwidth.js";
 import { createTelemetryCollector, createTelemetryExporter, createTelemetryListener, relayMetricProviders, } from "./telemetry.js";
 const config = loadConfig();
+const serviceVersion = readServiceVersion();
 const traceTunnel = process.env.GAIUS_TRACE_TUNNEL === "1";
 const dnsTestScenario = process.env.NODE_ENV === "test"
     ? {
@@ -50,6 +51,15 @@ const globalBandwidthBucket = config.maximumBandwidthTotal > 0
 // so a stray public reverse-proxy rule cannot scrape relay metrics.
 const otelPort = parseOtelPort(process.env.GAIUS_OTEL_PORT);
 const otelExporterUrl = parseOtelExporterUrl(process.env.GAIUS_OTEL_EXPORTER_URL);
+
+function readServiceVersion() {
+    const packagePath = new URL("../package.json", import.meta.url);
+    const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
+    if (typeof packageJson.version !== "string" || packageJson.version.length === 0) {
+        throw new Error("apps/bridge/package.json must declare a non-empty version");
+    }
+    return packageJson.version;
+}
 
 function parseOtelPort(raw) {
     if (raw === undefined || raw.trim().length === 0) {
@@ -2769,7 +2779,7 @@ httpServer.listen(config.listenPort, config.listenHost, () => {
 const otelCollector = createTelemetryCollector(
     [
         ["service.name", "gaius-relay-node"],
-        ["service.version", "0.4.0"],
+        ["service.version", serviceVersion],
         ["gaius.relay.node_id", config.registration?.nodeId ?? "unregistered"],
     ],
     relayMetricProviders(() => relayRuntimeSnapshot()),

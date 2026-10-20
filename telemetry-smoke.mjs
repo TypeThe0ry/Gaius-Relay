@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { once } from "node:events";
@@ -10,6 +11,8 @@ const host = "127.0.0.1";
 const origin = "http://127.0.0.1:8781";
 const bridgeToken = "relay-telemetry-runtime-generated-token";
 const directory = fileURLToPath(new URL(".", import.meta.url));
+const packageVersion = JSON.parse(readFileSync(new URL("./package.json", import.meta.url),
+    "utf8")).version;
 
 async function getFreePort() {
     const probe = createServer();
@@ -22,6 +25,13 @@ async function getFreePort() {
 
 const bridgePort = await getFreePort();
 const otelPort = await getFreePort();
+
+function isExpectedWindowsReset(error) {
+    return process.platform === "win32" && error?.code === "ECONNRESET";
+}
+
+let fixtureError;
+let collectorError;
 
 function assert(condition, label) {
     if (!condition) {
@@ -43,6 +53,11 @@ async function waitFor(predicate, label, timeoutMs = 20000) {
 // Mock OTLP collector: records every POSTed /v1/metrics payload.
 const collectorPayloads = [];
 const collector = createHttpServer((request, response) => {
+    request.on("error", (error) => {
+        if (!isExpectedWindowsReset(error)) {
+            collectorError = error;
+        }
+    });
     if (request.method !== "POST" || !request.url.endsWith("/v1/metrics")) {
         response.writeHead(404);
         response.end();
@@ -68,7 +83,12 @@ const fixture = createServer((socket) => {
     socket.on("data", (data) => {
         socket.write(data);
     });
-    socket.on("error", () => socket.destroy());
+    socket.on("error", (error) => {
+        if (!isExpectedWindowsReset(error)) {
+            fixtureError = error;
+        }
+        socket.destroy();
+    });
 });
 fixture.listen(0, host);
 await once(fixture, "listening");
@@ -91,6 +111,12 @@ const bridge = spawn(process.execPath, ["dist/main.js"], {
         GAIUS_OTEL_EXPORT_INTERVAL_MS: "2000",
     },
     stdio: ["ignore", "pipe", "pipe"],
+});
+let bridgeError;
+bridge.on("error", (error) => {
+    if (!isExpectedWindowsReset(error)) {
+        bridgeError = error;
+    }
 });
 let output = "";
 bridge.stdout.setEncoding("utf8");
@@ -142,6 +168,10 @@ try {
         metrics.resourceMetrics.length === 1, "OTLP resourceMetrics shape");
     const scope = metrics.resourceMetrics[0].scopeMetrics[0];
     assert(scope.scope.name === "dev.gaius.relay-node", "OTLP scope name");
+    const versionAttribute = metrics.resourceMetrics[0].resource.attributes.find((attribute) =>
+        attribute.key === "service.version");
+    assert(versionAttribute?.value.stringValue === packageVersion,
+        "service version comes from bridge package metadata");
     const names = scope.metrics.map((metric) => metric.name);
     assert(names.includes("gaius.tunnel.active"), "tunnel gauge present");
     const trafficIn = scope.metrics.find((metric) =>
@@ -164,6 +194,9 @@ try {
     const exported = collectorPayloads[0];
     assert(exported.resourceMetrics[0].scopeMetrics[0].scope.name ===
         "dev.gaius.relay-node", "exported payload is OTLP for the relay scope");
+    assert(bridgeError === undefined, "bridge child process error");
+    assert(fixtureError === undefined, "fixture socket error");
+    assert(collectorError === undefined, "collector request error");
 
     console.log("telemetry smoke passed");
 } finally {
