@@ -127,6 +127,16 @@ export function loadConfig() {
         idleTimeoutMs: parseInteger("GAIUS_IDLE_TIMEOUT_MS", 10 * 60_000, 1_000, 3_600_000),
         maximumConnections: parseInteger("GAIUS_MAXIMUM_CONNECTIONS", 1024, 1, 100_000),
         maximumFrameBytes: parseInteger("GAIUS_MAXIMUM_FRAME_BYTES", 16 * 1024 * 1024, 1024, 16 * 1024 * 1024),
+        // Zero disables the limit; otherwise bytes per second (per tunnel or
+        // node-wide) and bytes per tunnel lifetime. Rate limiting pauses the
+        // paused source instead of dropping tunnel bytes.
+        trafficStats: process.env.GAIUS_TRAFFIC_STATS !== "0",
+        maximumBandwidthPerConnection: parseInteger(
+            "GAIUS_MAXIMUM_BANDWIDTH_PER_CONNECTION", 0, 0, 1_000_000_000),
+        maximumBandwidthTotal: parseInteger(
+            "GAIUS_MAXIMUM_BANDWIDTH_TOTAL", 0, 0, 1_000_000_000),
+        maximumTransferPerConnection: parseInteger(
+            "GAIUS_MAXIMUM_TRANSFER_PER_CONNECTION", 0, 0, 1_000_000_000_000),
         targetAffinityMs: parseInteger(
             "GAIUS_TARGET_AFFINITY_MS", 5 * 60_000, 1_000, 3_600_000),
         maximumTargetRoutes: parseInteger(

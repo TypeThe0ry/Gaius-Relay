@@ -20,6 +20,8 @@ const config = {
     allowPrivateNodes: process.env.GAIUS_REGISTRY_ALLOW_PRIVATE_NODES === "1",
     allowTokenProtectedNodes:
         process.env.GAIUS_REGISTRY_ALLOW_TOKEN_PROTECTED_NODES === "1",
+    requireTrafficLimits:
+        process.env.GAIUS_REGISTRY_REQUIRE_TRAFFIC_LIMITS === "1",
     requireAbuseContact:
         process.env.GAIUS_REGISTRY_REQUIRE_ABUSE_CONTACT === "1",
 };
@@ -193,6 +195,16 @@ async function verifyRegistration(nodeId, payload) {
         throw new RequestError(400, "RelayNode manifest does not declare an abuse contact");
     }
     const capabilities = Array.isArray(manifest.capabilities) ? manifest.capabilities : [];
+    if (config.requireTrafficLimits) {
+        const traffic = manifest.traffic;
+        const configuredLimit = Number(traffic?.bandwidthPerConnectionBytesPerSecond) > 0 ||
+            Number(traffic?.bandwidthTotalBytesPerSecond) > 0 ||
+            Number(traffic?.transferPerConnectionBytes) > 0;
+        if (traffic?.enabled !== true || !configuredLimit ||
+                !capabilities.includes("traffic-accounting")) {
+            throw new RequestError(400, "RelayNode does not enforce traffic accounting and limits");
+        }
+    }
     if (!capabilities.includes("tcp-tunnel")) {
         throw new RequestError(400, "RelayNode does not advertise tcp-tunnel capability");
     }

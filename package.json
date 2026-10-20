@@ -13,6 +13,7 @@
     "smoke": "node framed-stream-smoke.mjs && node relay-frame-batching-smoke.mjs && node client-tcp-bounded-drain-smoke.mjs && node server-packet-processor-isolation-smoke.mjs && node multiplayer-smoke.mjs && node resource-pack-timeout-smoke.mjs && node resource-pack-stream-smoke.mjs && node registry-smoke.mjs && node local-relay/scripts/browser-http-proxy-routing-smoke.mjs && node local-relay/scripts/browser-relay-routing-smoke.mjs && node local-relay/scripts/browser-inbound-backpressure-smoke.mjs && node local-relay/scripts/browser-outbound-backpressure-smoke.mjs && node local-relay/scripts/browser-global-pump-fairness-smoke.mjs && node local-relay/scripts/client-packet-drain-smoke.mjs && node local-relay/scripts/browser-bridge-install-lifecycle-smoke.mjs && node local-relay/scripts/browser-inbound-pump-jsbody-smoke.mjs && node local-relay/scripts/browser-compression-decoder-model-smoke.mjs && node local-relay/scripts/browser-compression-decoder-production-smoke.mjs && node browser-full-path-contract-smoke.mjs && node browser-arrival-timeline-runtime-smoke.mjs",
     "smoke:profiles": "node profile-protocol-smoke.mjs",
     "smoke:public": "node public-relay-smoke.mjs",
+    "smoke:bandwidth": "node bandwidth-smoke.mjs",
     "smoke:abuse-contact": "node abuse-contact-smoke.mjs",
     "smoke:browser-full-path": "node browser-full-path-smoke.mjs",
     "stress:browser-full-path": "node browser-full-path-stress.mjs",

@@ -16,6 +16,9 @@ GAIUS_ALLOWED_RESOURCE_PACK_HOSTS='cdn.example.net,gitlab.com' \
 GAIUS_BRIDGE_TOKEN=<runtime-secret> \
 GAIUS_CONNECT_TIMEOUT_MS=10000 \
 GAIUS_MAXIMUM_CONNECTIONS=256 \
+GAIUS_MAXIMUM_BANDWIDTH_PER_CONNECTION=0 \
+GAIUS_MAXIMUM_BANDWIDTH_TOTAL=0 \
+GAIUS_MAXIMUM_TRANSFER_PER_CONNECTION=0 \
 GAIUS_TARGET_AFFINITY_MS=300000 \
 GAIUS_MAXIMUM_TARGET_ROUTES=4096 \
 GAIUS_RESOURCE_PACK_CACHE_MS=300000 \
@@ -46,6 +49,31 @@ blocked by default even if this list contains `*`. Set
 downloads and defaults to the TCP host list for compatibility. Set the latter
 to the CDN domains used by the allowed servers; this avoids opening arbitrary
 TCP destinations just because a server hosts its pack elsewhere.
+
+Public nodes should also configure traffic limits (bytes per second; `0`
+disables each limit). `GAIUS_MAXIMUM_BANDWIDTH_PER_CONNECTION` and
+`GAIUS_MAXIMUM_BANDWIDTH_TOTAL` are token-bucket rate limits that pause the
+tunnel source and resume it on refill, so no tunnel bytes are dropped.
+`GAIUS_MAXIMUM_TRANSFER_PER_CONNECTION` closes a tunnel with close code 1009
+once a single connection exceeds the lifetime byte cap. Each tunneled byte
+consumes from the per-connection bucket once per direction (browser to
+server and server to browser), so the cap applies to the sum of both
+directions: `GAIUS_MAXIMUM_BANDWIDTH_PER_CONNECTION=8388608` allows roughly
+4 MiB/s each way for a symmetric stream. Bulk throughput is paused and
+resumed on refill while small interactive frames continue to flow, so game
+latency is unaffected even when throttled. When
+`GAIUS_TRAFFIC_STATS` is enabled (the default), the manifest and runtime
+snapshot report live totals and rates under `traffic`, and the manifest
+advertises the `traffic-accounting`, `bandwidth-limits`, and `transfer-limits`
+capabilities. A registry started with
+`GAIUS_REGISTRY_REQUIRE_TRAFFIC_LIMITS=1` rejects RelayNodes whose manifest
+does not enable traffic accounting.
+
+Covered by `npm run smoke:bandwidth` (throttle timing, manifest fields, and
+transfer-cap close code 1009). A reusable benchmark harness lives in
+`relay-bench.mjs`; run it with `node relay-bench.mjs <bridge-dir> <port>` and
+an optional `--per-conn-rate <bytes/s>` to record throughput, latency, and CPU
+usage.
 
 The client requests `/proxy/resource-pack?stream=1` to receive real resource-pack
 bytes while the upstream download is still in progress. The RelayNode forwards a
