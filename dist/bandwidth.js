@@ -43,8 +43,15 @@ export function createTokenBucket(rateBytesPerSecond, burstBytes) {
                 return 0;
             }
             const deficit = bytes - tokens;
-            tokens = 0;
             return Math.max(1, Math.ceil((deficit / rateBytesPerSecond) * 1000));
+        },
+        waitFor(bytes, now = Date.now()) {
+            this.refill(now);
+            if (tokens >= bytes || rateBytesPerSecond <= 0) {
+                return 0;
+            }
+            return Math.max(1, Math.ceil(((bytes - tokens) /
+                rateBytesPerSecond) * 1000));
         },
     };
 }
@@ -140,17 +147,20 @@ export function createTunnelLimiter(scheduler, meter, options, callbacks) {
     const perConnectionRate = options.perConnectionRate;
     const globalRate = options.globalRate;
     const transferCap = options.transferCap;
-    const enabled = perConnectionRate > 0 || globalRate > 0 || transferCap > 0;
-    const bucket = enabled && perConnectionRate > 0
+    // Accounting is unconditional; only enforcement depends on the limits.
+    // With every limit at zero the limiter counts bytes and never pauses.
+    const enforcing = perConnectionRate > 0 || globalRate > 0 || transferCap > 0;
+    const bucket = perConnectionRate > 0
         ? createTokenBucket(perConnectionRate, perConnectionRate)
         : undefined;
-    const globalBucket = enabled && globalRate > 0
+    const globalBucket = globalRate > 0
         ? options.globalBucket
         : undefined;
     let transferredBytes = 0;
     let transferLimitReported = false;
     let disposed = false;
     const paused = { ingress: false, egress: false };
+    const pausedBytes = { ingress: 0, egress: 0 };
     const tunnel = {
         get throttled() {
             return paused.ingress || paused.egress;
@@ -163,21 +173,23 @@ export function createTunnelLimiter(scheduler, meter, options, callbacks) {
                 if (!paused[direction]) {
                     continue;
                 }
-                // Probe with a single byte: both buckets must be able to
-                // grant it before the paused read is resumed, otherwise the
-                // next account() would immediately re-pause.
-                const probe = bucket === undefined ? 0 : bucket.tryConsume(1, now);
-                const globalProbe = globalBucket === undefined
-                    ? 0
-                    : globalBucket.tryConsume(1, now);
-                if (probe === 0 && globalProbe === 0) {
+                // Resume only when a complete source chunk can be admitted.
+                // A one-byte probe would let a large WebSocket/TCP chunk
+                // bypass the configured rate on every scheduler tick.
+                const required = Math.max(1, pausedBytes[direction]);
+                const perConnectionWait = bucket === undefined
+                    ? 0 : bucket.waitFor(required, now);
+                const globalWait = globalBucket === undefined
+                    ? 0 : globalBucket.waitFor(required, now);
+                if (perConnectionWait === 0 && globalWait === 0) {
                     paused[direction] = false;
+                    pausedBytes[direction] = 0;
                     callbacks.resume[direction]();
                 }
             }
         },
         account(direction, bytes) {
-            if (disposed || !enabled) {
+            if (disposed) {
                 return;
             }
             if (direction === "ingress") {
@@ -193,19 +205,22 @@ export function createTunnelLimiter(scheduler, meter, options, callbacks) {
                 disposed = true;
                 scheduler.unregister(tunnel);
                 callbacks.onTransferLimit?.();
-                return;
+                return false;
             }
-            let waitMs = 0;
-            if (bucket !== undefined) {
-                waitMs = bucket.tryConsume(bytes);
-            }
-            if (waitMs === 0 && globalBucket !== undefined) {
-                waitMs = globalBucket.tryConsume(bytes);
-            }
+            const perConnectionWait = bucket === undefined
+                ? 0 : bucket.tryConsume(bytes);
+            const globalWait = globalBucket === undefined
+                ? 0 : globalBucket.tryConsume(bytes);
+            const waitMs = Math.max(perConnectionWait, globalWait);
             if (waitMs > 0 && !paused[direction]) {
                 paused[direction] = true;
+                pausedBytes[direction] = bytes;
                 callbacks.pause[direction]();
             }
+            else if (waitMs > 0) {
+                pausedBytes[direction] = Math.max(pausedBytes[direction], bytes);
+            }
+            return true;
         },
         dispose() {
             if (!disposed) {
@@ -214,7 +229,7 @@ export function createTunnelLimiter(scheduler, meter, options, callbacks) {
             }
         },
     };
-    if (enabled) {
+    if (enforcing) {
         scheduler.register(tunnel);
     }
     return tunnel;

@@ -2473,7 +2473,9 @@ webSocketServer.on("connection", (webSocket) => {
                 };
                 tcpSocket.on("data", (chunk) => {
                     serverFrameTelemetry.dataCallbacks++;
-                    tunnelBandwidth.account("egress", chunk.byteLength);
+                    if (tunnelBandwidth.account("egress", chunk.byteLength) === false) {
+                        return;
+                    }
                     if (relayFrameTimelineEnabled) {
                         recordRelayFrameTcpData(
                             relayFrameTimelineState,
@@ -2566,7 +2568,9 @@ webSocketServer.on("connection", (webSocket) => {
                     return;
                 }
                 const clientData = toBuffer(data);
-                tunnelBandwidth.account("ingress", clientData.byteLength);
+                if (tunnelBandwidth.account("ingress", clientData.byteLength) === false) {
+                    return;
+                }
                 lastClientTrafficAt = Date.now();
                 if (traceTunnel) {
                     traceTunnelEvent(
@@ -3171,7 +3175,9 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
         closed: false,
         flowPaused: false,
         backpressurePaused: false,
-        bandwidthPaused: false,
+        ingressBandwidthPaused: false,
+        egressBandwidthPaused: false,
+        bandwidth: undefined,
     };
     session[request.role] = endpoint;
     const endpointBandwidth = createTunnelLimiter(
@@ -3186,33 +3192,35 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
         {
             pause: {
                 ingress: () => {
-                    endpoint.bandwidthPaused = true;
+                    endpoint.ingressBandwidthPaused = true;
                     updateLocalReadState(endpoint);
                 },
                 egress: () => {
-                    endpoint.bandwidthPaused = true;
+                    endpoint.egressBandwidthPaused = true;
                     updateLocalReadState(endpoint);
                 },
             },
             resume: {
                 ingress: () => {
-                    endpoint.bandwidthPaused = false;
+                    endpoint.ingressBandwidthPaused = false;
                     updateLocalReadState(endpoint);
                 },
                 egress: () => {
-                    endpoint.bandwidthPaused = false;
+                    endpoint.egressBandwidthPaused = false;
                     updateLocalReadState(endpoint);
                 },
             },
             onTransferLimit: () =>
                 closeLocalTunnelSession(request.sessionId, 1009, "Transfer limit exceeded"),
         });
+    endpoint.bandwidth = endpointBandwidth;
     const removeEndpoint = (code, reason) => {
         if (endpoint.closed) {
             return;
         }
         endpoint.closed = true;
         endpointBandwidth.dispose();
+        endpoint.bandwidth = undefined;
         const current = localTunnelSessions.get(request.sessionId);
         if (current?.[request.role] === endpoint) {
             current[request.role] = undefined;
@@ -3229,6 +3237,8 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
             peer.peer = undefined;
             if (!peer.closed) {
                 peer.closed = true;
+                peer.bandwidth?.dispose();
+                peer.bandwidth = undefined;
                 if (peer.webSocket.readyState === WebSocket.OPEN ||
                     peer.webSocket.readyState === WebSocket.CONNECTING) {
                     peer.webSocket.close(1000, "Local tunnel peer closed");
@@ -3267,7 +3277,9 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
             return;
         }
         const bytes = toBuffer(data);
-        endpointBandwidth.account("ingress", bytes.byteLength);
+        if (endpointBandwidth.account("ingress", bytes.byteLength) === false) {
+            return;
+        }
         if (peer === undefined || peer.closed || peer.webSocket.readyState !== WebSocket.OPEN) {
             if (endpoint.pendingFrames.length >= maximumLocalPrePairFrames ||
                 endpoint.pendingBytes + bytes.byteLength > maximumLocalPrePairBytes) {
@@ -3276,6 +3288,9 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
             }
             endpoint.pendingFrames.push(bytes);
             endpoint.pendingBytes += bytes.byteLength;
+            return;
+        }
+        if (peer.bandwidth?.account("egress", bytes.byteLength) === false) {
             return;
         }
         peer.webSocket.send(bytes, { binary: true }, (error) => {
@@ -3331,6 +3346,9 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
                 continue;
             }
             for (const frame of endpoint.pendingFrames) {
+                if (peer.bandwidth?.account("egress", frame.byteLength) === false) {
+                    break;
+                }
                 peer.webSocket.send(frame, { binary: true }, (error) => {
                     if (error) {
                         closeLocalTunnelSession(request.sessionId, 1011, "Local tunnel pre-pair frame failed");
@@ -3343,7 +3361,8 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
     }
 }
 function updateLocalReadState(endpoint) {
-    if (endpoint.flowPaused || endpoint.backpressurePaused || endpoint.bandwidthPaused) {
+    if (endpoint.flowPaused || endpoint.backpressurePaused ||
+            endpoint.ingressBandwidthPaused || endpoint.egressBandwidthPaused) {
         endpoint.webSocket.pause();
     }
     else {
@@ -3362,6 +3381,8 @@ function closeLocalTunnelSession(sessionId, code, reason) {
             continue;
         }
         endpoint.closed = true;
+        endpoint.bandwidth?.dispose();
+        endpoint.bandwidth = undefined;
         endpoint.peer = undefined;
         if (endpoint.webSocket.readyState === WebSocket.OPEN ||
             endpoint.webSocket.readyState === WebSocket.CONNECTING) {
