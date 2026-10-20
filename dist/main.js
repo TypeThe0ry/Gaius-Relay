@@ -1,7 +1,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns";
 import { resolveSrv } from "node:dns/promises";
-import { createReadStream, unlinkSync } from "node:fs";
+import { createReadStream, readFileSync, unlinkSync } from "node:fs";
 import { open, unlink } from "node:fs/promises";
 import { createServer } from "node:http";
 import { connect } from "node:net";
@@ -13,7 +13,9 @@ import { isHostAllowed, isOriginAllowed, isPrivateNetworkAddress, normalizeHost,
 import { MINECRAFT_PROFILES, resolveMinecraftProfile } from "./protocol.js";
 import { MinecraftFrameAccumulator } from "./framed-stream.js";
 import { createBandwidthScheduler, createTokenBucket, createTrafficMeter, createTunnelLimiter, } from "./bandwidth.js";
+import { createTelemetryCollector, createTelemetryExporter, createTelemetryListener, relayMetricProviders, } from "./telemetry.js";
 const config = loadConfig();
+const serviceVersion = readServiceVersion();
 const traceTunnel = process.env.GAIUS_TRACE_TUNNEL === "1";
 const dnsTestScenario = process.env.NODE_ENV === "test"
     ? {
@@ -43,6 +45,48 @@ const globalBandwidthBucket = config.maximumBandwidthTotal > 0
         config.maximumBandwidthTotal,
         Math.max(config.maximumBandwidthTotal, 64 * 1024))
     : undefined;
+// Private OTel metrics surface. Both parts are opt-in: the pull listener
+// only starts when GAIUS_OTEL_PORT is set, and the push exporter only runs
+// when GAIUS_OTEL_EXPORTER_URL is set. The default listen host is loopback
+// so a stray public reverse-proxy rule cannot scrape relay metrics.
+const otelPort = parseOtelPort(process.env.GAIUS_OTEL_PORT);
+const otelExporterUrl = parseOtelExporterUrl(process.env.GAIUS_OTEL_EXPORTER_URL);
+
+function readServiceVersion() {
+    const packagePath = new URL("../package.json", import.meta.url);
+    const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
+    if (typeof packageJson.version !== "string" || packageJson.version.length === 0) {
+        throw new Error("apps/bridge/package.json must declare a non-empty version");
+    }
+    return packageJson.version;
+}
+
+function parseOtelPort(raw) {
+    if (raw === undefined || raw.trim().length === 0) {
+        return undefined;
+    }
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+        throw new Error("GAIUS_OTEL_PORT must be an integer between 1 and 65535");
+    }
+    return parsed;
+}
+
+function parseOtelExporterUrl(raw) {
+    if (raw === undefined || raw.trim().length === 0) {
+        return undefined;
+    }
+    try {
+        const url = new URL(raw);
+        if (url.protocol !== "http:" && url.protocol !== "https:") {
+            throw new Error("not http(s)");
+        }
+        return url.href;
+    }
+    catch {
+        throw new Error("GAIUS_OTEL_EXPORTER_URL must be an absolute http(s) URL");
+    }
+}
 const maximumResourcePackBytes = 250 * 1024 * 1024;
 // The live resource-pack sender tails the same temporary file that becomes the
 // verified cache entry. Only this fixed read window is held in memory even if a
@@ -100,6 +144,9 @@ const relayCapabilities = [
     "public-target-guard",
     "target-attestation",
     "runtime-telemetry",
+    ...(otelPort !== undefined || otelExporterUrl !== undefined
+        ? ["otel-metrics"]
+        : []),
     ...(config.trafficStats ? ["traffic-accounting"] : []),
     ...(config.maximumBandwidthPerConnection > 0 || config.maximumBandwidthTotal > 0
         ? ["bandwidth-limits"]
@@ -2726,8 +2773,51 @@ httpServer.listen(config.listenPort, config.listenHost, () => {
     if (config.accessToken === undefined) {
         console.warn("GAIUS_BRIDGE_TOKEN is unset; this is acceptable only for local development.");
     }
+    startTelemetry();
     startRelayRegistration();
 });
+const otelCollector = createTelemetryCollector(
+    [
+        ["service.name", "gaius-relay-node"],
+        ["service.version", serviceVersion],
+        ["gaius.relay.node_id", config.registration?.nodeId ?? "unregistered"],
+    ],
+    relayMetricProviders(() => relayRuntimeSnapshot()),
+);
+let telemetryListener;
+let telemetryExporter;
+function startTelemetry() {
+    if (otelPort !== undefined) {
+        // Default to loopback: metrics are private and must never be exposed
+        // through the public reverse-proxy surface.
+        const listenHost = parseOtelHost(process.env.GAIUS_OTEL_HOST);
+        telemetryListener = createTelemetryListener(otelCollector, listenHost, otelPort);
+        console.log(
+            `Gaius OTel metrics listening on http://${listenHost}:${otelPort}/v1/metrics`);
+    }
+    if (otelExporterUrl !== undefined) {
+        const intervalMs = parseOtelExportIntervalMs(
+            process.env.GAIUS_OTEL_EXPORT_INTERVAL_MS);
+        telemetryExporter = createTelemetryExporter(
+            otelCollector, otelExporterUrl, intervalMs);
+    }
+}
+function parseOtelHost(raw) {
+    const host = raw?.trim() || "127.0.0.1";
+    if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
+        throw new Error(
+            "GAIUS_OTEL_HOST must be a loopback address; expose metrics through a private proxy");
+    }
+    return host;
+}
+function parseOtelExportIntervalMs(raw) {
+    const parsed = Number(raw ?? "60000");
+    if (!Number.isInteger(parsed) || parsed < 1000 || parsed > 3_600_000) {
+        throw new Error(
+            "GAIUS_OTEL_EXPORT_INTERVAL_MS must be an integer between 1000 and 3600000");
+    }
+    return parsed;
+}
 function startRelayRegistration() {
     if (config.registration === undefined) {
         return;
@@ -2846,6 +2936,11 @@ async function shutdownRelayNode(code) {
     for (const client of webSocketServer.clients) {
         client.terminate();
     }
+    telemetryExporter?.stop();
+    if (telemetryListener !== undefined) {
+        await telemetryListener.close();
+    }
+    bandwidthScheduler.dispose();
     await new Promise((resolve) => httpServer.close(resolve));
     clearTimeout(forcedExit);
     process.exit(code);

@@ -67,7 +67,16 @@ snapshot report live totals and rates under `traffic`, and the manifest
 advertises the `traffic-accounting`, `bandwidth-limits`, and `transfer-limits`
 capabilities. A registry started with
 `GAIUS_REGISTRY_REQUIRE_TRAFFIC_LIMITS=1` rejects RelayNodes whose manifest
-does not enable traffic accounting.
+does not enable traffic accounting. The node can also export its metrics
+over OpenTelemetry: set `GAIUS_OTEL_PORT` to serve OTLP/HTTP JSON on
+`GET /v1/metrics` from a private listener (default host `127.0.0.1` via
+`GAIUS_OTEL_HOST`; never expose it through the public reverse proxy), or set
+`GAIUS_OTEL_EXPORTER_URL` to POST the same payloads to an OTLP collector on
+`GAIUS_OTEL_EXPORT_INTERVAL_MS` (default 60000). Exported metrics cover
+tunnel and transport gauges, tunnel traffic counters and rates, throttled
+tunnels, proxy bytes, registry registration results, and keepalive proxy
+counters. The manifest advertises the `otel-metrics` capability when either
+is configured.
 
 Covered by `npm run smoke:bandwidth` (throttle timing, manifest fields, and
 transfer-cap close code 1009). A reusable benchmark harness lives in
