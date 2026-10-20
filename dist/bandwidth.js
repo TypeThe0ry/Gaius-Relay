@@ -43,8 +43,15 @@ export function createTokenBucket(rateBytesPerSecond, burstBytes) {
                 return 0;
             }
             const deficit = bytes - tokens;
-            tokens = 0;
             return Math.max(1, Math.ceil((deficit / rateBytesPerSecond) * 1000));
+        },
+        waitFor(bytes, now = Date.now()) {
+            this.refill(now);
+            if (tokens >= bytes || rateBytesPerSecond <= 0) {
+                return 0;
+            }
+            return Math.max(1, Math.ceil(((bytes - tokens) /
+                rateBytesPerSecond) * 1000));
         },
     };
 }
@@ -153,6 +160,7 @@ export function createTunnelLimiter(scheduler, meter, options, callbacks) {
     let transferLimitReported = false;
     let disposed = false;
     const paused = { ingress: false, egress: false };
+    const pausedBytes = { ingress: 0, egress: 0 };
     const tunnel = {
         get throttled() {
             return paused.ingress || paused.egress;
@@ -165,15 +173,17 @@ export function createTunnelLimiter(scheduler, meter, options, callbacks) {
                 if (!paused[direction]) {
                     continue;
                 }
-                // Probe with a single byte: both buckets must be able to
-                // grant it before the paused read is resumed, otherwise the
-                // next account() would immediately re-pause.
-                const probe = bucket === undefined ? 0 : bucket.tryConsume(1, now);
-                const globalProbe = globalBucket === undefined
-                    ? 0
-                    : globalBucket.tryConsume(1, now);
-                if (probe === 0 && globalProbe === 0) {
+                // Resume only when a complete source chunk can be admitted.
+                // A one-byte probe would let a large WebSocket/TCP chunk
+                // bypass the configured rate on every scheduler tick.
+                const required = Math.max(1, pausedBytes[direction]);
+                const perConnectionWait = bucket === undefined
+                    ? 0 : bucket.waitFor(required, now);
+                const globalWait = globalBucket === undefined
+                    ? 0 : globalBucket.waitFor(required, now);
+                if (perConnectionWait === 0 && globalWait === 0) {
                     paused[direction] = false;
+                    pausedBytes[direction] = 0;
                     callbacks.resume[direction]();
                 }
             }
@@ -195,19 +205,22 @@ export function createTunnelLimiter(scheduler, meter, options, callbacks) {
                 disposed = true;
                 scheduler.unregister(tunnel);
                 callbacks.onTransferLimit?.();
-                return;
+                return false;
             }
-            let waitMs = 0;
-            if (bucket !== undefined) {
-                waitMs = bucket.tryConsume(bytes);
-            }
-            if (waitMs === 0 && globalBucket !== undefined) {
-                waitMs = globalBucket.tryConsume(bytes);
-            }
+            const perConnectionWait = bucket === undefined
+                ? 0 : bucket.tryConsume(bytes);
+            const globalWait = globalBucket === undefined
+                ? 0 : globalBucket.tryConsume(bytes);
+            const waitMs = Math.max(perConnectionWait, globalWait);
             if (waitMs > 0 && !paused[direction]) {
                 paused[direction] = true;
+                pausedBytes[direction] = bytes;
                 callbacks.pause[direction]();
             }
+            else if (waitMs > 0) {
+                pausedBytes[direction] = Math.max(pausedBytes[direction], bytes);
+            }
+            return true;
         },
         dispose() {
             if (!disposed) {

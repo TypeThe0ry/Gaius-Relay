@@ -22,6 +22,8 @@ const config = {
         process.env.GAIUS_REGISTRY_ALLOW_TOKEN_PROTECTED_NODES === "1",
     requireTrafficLimits:
         process.env.GAIUS_REGISTRY_REQUIRE_TRAFFIC_LIMITS === "1",
+    requireAbuseContact:
+        process.env.GAIUS_REGISTRY_REQUIRE_ABUSE_CONTACT === "1",
 };
 
 const leases = new Map();
@@ -185,10 +187,24 @@ async function verifyRegistration(nodeId, payload) {
     if (manifest.allowsPrivateTargets && !config.allowPrivateNodes) {
         throw new RequestError(400, "Public RelayNodes must block private TCP targets");
     }
-    if (config.requireTrafficLimits && manifest.traffic?.enabled !== true) {
-        throw new RequestError(400, "RelayNode does not enforce traffic accounting and limits");
+    if (manifest.abuseContact !== undefined &&
+            !isValidAbuseContact(manifest.abuseContact)) {
+            throw new RequestError(400, "RelayNode abuse contact must be a mailto: address or an https: URL");
+    }
+    if (config.requireAbuseContact && manifest.abuseContact === undefined) {
+        throw new RequestError(400, "RelayNode manifest does not declare an abuse contact");
     }
     const capabilities = Array.isArray(manifest.capabilities) ? manifest.capabilities : [];
+    if (config.requireTrafficLimits) {
+        const traffic = manifest.traffic;
+        const configuredLimit = Number(traffic?.bandwidthPerConnectionBytesPerSecond) > 0 ||
+            Number(traffic?.bandwidthTotalBytesPerSecond) > 0 ||
+            Number(traffic?.transferPerConnectionBytes) > 0;
+        if (traffic?.enabled !== true || !configuredLimit ||
+                !capabilities.includes("traffic-accounting")) {
+            throw new RequestError(400, "RelayNode does not enforce traffic accounting and limits");
+        }
+    }
     if (!capabilities.includes("tcp-tunnel")) {
         throw new RequestError(400, "RelayNode does not advertise tcp-tunnel capability");
     }
@@ -197,6 +213,27 @@ async function verifyRegistration(nodeId, payload) {
         throw new RequestError(400, "RelayNode name is invalid");
     }
     return {name, url: publicUrl.href, priority};
+}
+
+function isValidAbuseContact(value) {
+    if (typeof value !== "string") {
+        return false;
+    }
+    const contact = value.trim();
+    if (contact.length === 0 || contact.length > 320 || /[\r\n]/u.test(contact)) {
+        return false;
+    }
+    if (/^mailto:[^\s@<>"'\/?#]+@[^\s@<>"'\/?#]+\.[^\s@<>"'\/?#]+$/u.test(contact)) {
+        return true;
+    }
+    try {
+        const url = new URL(contact);
+        return url.protocol === "https:" && url.hostname.length > 0 &&
+            !url.username && !url.password;
+    }
+    catch {
+        return false;
+    }
 }
 
 async function fetchNodeManifest(url) {

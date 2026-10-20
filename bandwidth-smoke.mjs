@@ -63,6 +63,7 @@ async function startEchoFixture() {
         socket.on("data", (data) => {
             socket.write(data);
         });
+        socket.on("error", () => socket.destroy());
     });
     fixture.listen(0, host);
     await once(fixture, "listening");
@@ -73,6 +74,15 @@ async function fetchManifest(port) {
     const response = await fetch(
         `http://${host}:${port}/relay-node/v1?token=${bridgeToken}`);
     return response.json();
+}
+
+async function getFreePort() {
+    const probe = createServer();
+    probe.listen(0, host);
+    await once(probe, "listening");
+    const port = probe.address().port;
+    await new Promise((resolve) => probe.close(resolve));
+    return port;
 }
 
 // Sends `totalBytes` in 16 KiB WebSocket frames and resolves once the same
@@ -113,7 +123,7 @@ async function scenarioRateLimit() {
     const totalBytes = 512 * 1024;
     const fixture = await startEchoFixture();
     const fixturePort = fixture.address().port;
-    const bridgePort = 18790;
+    const bridgePort = await getFreePort();
     const bridge = startBridge({
         GAIUS_MAXIMUM_BANDWIDTH_PER_CONNECTION: String(bandwidthPerConnection),
     }, bridgePort);
@@ -182,7 +192,7 @@ async function scenarioRateLimit() {
 async function scenarioTransferLimit() {
     const fixture = await startEchoFixture();
     const fixturePort = fixture.address().port;
-    const bridgePort = 18791;
+    const bridgePort = await getFreePort();
     const bridge = startBridge({
         GAIUS_MAXIMUM_TRANSFER_PER_CONNECTION: String(128 * 1024),
     }, bridgePort);
