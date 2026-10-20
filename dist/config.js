@@ -147,6 +147,34 @@ export function loadConfig() {
             "GAIUS_RESOURCE_PACK_CACHE_ENTRIES", 64, 0, 4096),
         proxyKeepAlives,
         relayName: parseName("GAIUS_RELAY_NODE_NAME", "Gaius Translator Node"),
+        abuseContact: parseAbuseContact(process.env.GAIUS_ABUSE_CONTACT),
         registration: parseRegistration(),
     };
+}
+// Abuse contact for public node listings: a mailto: address or an https:
+// URL. Optional, but validated whenever it is set so a typo cannot publish
+// garbage next to the node name.
+function parseAbuseContact(raw) {
+    if (raw === undefined || raw.trim().length === 0) {
+        return undefined;
+    }
+    const value = raw.trim();
+    if (value.length > 320 || /[\r\n]/u.test(value)) {
+        throw new Error(
+            "GAIUS_ABUSE_CONTACT must be a single line of at most 320 characters");
+    }
+    if (/^mailto:[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value)) {
+        return value;
+    }
+    try {
+        const url = new URL(value);
+        if (url.protocol === "https:" && !url.username && !url.password) {
+            return url.href;
+        }
+    }
+    catch {
+        // Falls through to the error below.
+    }
+    throw new Error(
+        "GAIUS_ABUSE_CONTACT must be a mailto: address or an https: URL");
 }
