@@ -33,7 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           forbidden='asset-endpoint\.mojang|server\.archive|client\.archive|net\.minecraft|com\.mojang|relay-host\.site|typethe0ry\.github\.io|pages-relay\.relay-host\.site|runtime-generated-token|runtime-generated-token|runtime-generated-token'
-          if rg -n -i "$forbidden" . -g '!package-lock.json'; then
+          if rg -n -i "$forbidden" . -g '!package-lock.json' -g '!.github/workflows/ci.yml'; then
             echo 'public-boundary scan found a forbidden input, endpoint, or credential fixture' >&2
             exit 1
           fi
