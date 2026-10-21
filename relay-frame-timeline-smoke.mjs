@@ -362,7 +362,7 @@ const result = {
             "open send errors remain strict while closed callback errors are retained separately",
         ],
         notProven: [
-            "this is a server-free model/static contract, not a public relay-host.top run",
+            "this is a server-free model/static contract, not a public deployment run",
             "frame-to-browser correlation remains best-effort when coalescing or reconnecting",
         ],
     },
