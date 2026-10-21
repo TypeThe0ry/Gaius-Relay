@@ -4,10 +4,11 @@ import {spawn} from "node:child_process";
 import {fileURLToPath} from "node:url";
 import {tmpdir} from "node:os";
 import {readdir} from "node:fs/promises";
+import {ephemeralCredential} from "./test-support.mjs";
 
 const host = "127.0.0.1";
 const origin = "http://127.0.0.1:8781";
-const token = "timeout-runtime-generated-token-1234";
+const token = ephemeralCredential("resource-pack");
 const reserve = () => new Promise((resolve, reject) => {
   const server = createServer();
   server.once("error", reject);

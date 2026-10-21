@@ -4,10 +4,11 @@ import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "./node_modules/ws/wrapper.mjs";
+import { ephemeralCredential } from "./test-support.mjs";
 
 const host = "127.0.0.1";
 const origin = "http://127.0.0.1:8781";
-const bridgeToken = "relay-bandwidth-runtime-generated-token";
+const bridgeToken = ephemeralCredential("bridge");
 const directory = fileURLToPath(new URL(".", import.meta.url));
 const chunk = Buffer.alloc(16 * 1024, 0x61);
 

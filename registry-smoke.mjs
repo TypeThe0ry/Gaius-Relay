@@ -3,8 +3,9 @@ import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
 import { isPrivateNetworkAddress } from "./dist/policy.js";
+import { ephemeralCredential } from "./test-support.mjs";
 
-const registryToken = "gaius-registry-runtime-generated-token";
+const registryToken = ephemeralCredential("registry");
 const registryPort = await reservePort();
 const relayPort = await reservePort();
 const registryBase = `http://127.0.0.1:${registryPort}`;

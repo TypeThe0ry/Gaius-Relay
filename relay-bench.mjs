@@ -10,6 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { WebSocket } from "./node_modules/ws/wrapper.mjs";
+import { ephemeralCredential } from "./test-support.mjs";
 
 const directory = path.resolve(process.argv[2]);
 const port = Number(process.argv[3]);
@@ -18,7 +19,7 @@ const perConnRate = rateArg === -1 ? "0" : process.argv[rateArg + 1];
 
 const host = "127.0.0.1";
 const origin = "http://127.0.0.1:8781";
-const bridgeToken = "runtime-generated-token";
+const bridgeToken = ephemeralCredential("bench");
 const concurrent = 8;
 const payloadBytesPerTunnel = 32 * 1024 * 1024; // 32 MiB each way
 const frame = Buffer.alloc(64 * 1024, 0x62); // 64 KiB frames

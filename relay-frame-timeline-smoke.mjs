@@ -14,8 +14,8 @@ import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import {fileURLToPath} from "node:url";
 
-const repository = fileURLToPath(new URL("../..", import.meta.url));
-const relayMainPath = `${repository}/apps/bridge/dist/main.js`;
+const repository = fileURLToPath(new URL(".", import.meta.url));
+const relayMainPath = `${repository}/dist/main.js`;
 const relayMainSource = await readFile(relayMainPath, "utf8");
 
 const SCHEMA = "gaius.relay.server-frame-timeline.v1";

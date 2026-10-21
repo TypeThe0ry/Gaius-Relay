@@ -5,10 +5,11 @@ import {fileURLToPath} from "node:url";
 import {tmpdir} from "node:os";
 import {readdir} from "node:fs/promises";
 import {setTimeout as delay} from "node:timers/promises";
+import {ephemeralCredential} from "./test-support.mjs";
 
 const host = "127.0.0.1";
 const origin = "http://127.0.0.1:8781";
-const token = "stream-runtime-generated-token-1234";
+const token = ephemeralCredential("resource-pack");
 const listen = async (server) => {
   await new Promise((resolve, reject) => {
     server.once("error", reject);

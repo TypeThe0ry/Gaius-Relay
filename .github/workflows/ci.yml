@@ -1,0 +1,43 @@
+name: RelayNode CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Check runtime syntax
+        run: |
+          node --check dist/config.js
+          node --check dist/policy.js
+          node --check dist/main.js
+          node --check dist/registry.js
+      - name: Run self-contained tests
+        run: npm test
+      - name: Check public boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden='asset-endpoint\.mojang|server\.archive|client\.archive|net\.minecraft|com\.mojang|relay-host\.site|typethe0ry\.github\.io|pages-relay\.relay-host\.site|runtime-generated-token|runtime-generated-token|runtime-generated-token'
+          if rg -n -i "$forbidden" . -g '!package-lock.json'; then
+            echo 'public-boundary scan found a forbidden input, endpoint, or credential fixture' >&2
+            exit 1
+          fi
+          if git ls-files | rg -n '(^|/)(vanilla-server|browser-full-path|profile-protocol|offline-server|online-mode-server)'; then
+            echo 'public-boundary scan found a client/server integration file' >&2
+            exit 1
+          fi

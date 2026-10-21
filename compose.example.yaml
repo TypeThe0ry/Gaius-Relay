@@ -8,7 +8,7 @@ services:
     environment:
       GAIUS_REGISTRY_HOST: "0.0.0.0"
       GAIUS_REGISTRY_PORT: "8083"
-      GAIUS_REGISTRY_TOKEN: "runtime-generated-token"
+      GAIUS_REGISTRY_TOKEN: "${GAIUS_REGISTRY_TOKEN:?set outside repository}"
       GAIUS_REGISTRY_LEASE_MS: "90000"
       GAIUS_REGISTRY_MAXIMUM_NODES: "256"
 
@@ -35,6 +35,6 @@ services:
       GAIUS_RELAY_PUBLIC_URL: "wss://relay.example/tunnel"
       GAIUS_RELAY_PRIORITY: "0"
       GAIUS_RELAY_REGISTRY_URL: "http://gaius-registry:8083/relay-registry/v1/nodes/"
-      GAIUS_RELAY_REGISTRY_TOKEN: "runtime-generated-token"
+      GAIUS_RELAY_REGISTRY_TOKEN: "${GAIUS_REGISTRY_TOKEN:?set outside repository}"
       # Safe only because this HTTP request stays on the private compose network.
       GAIUS_RELAY_ALLOW_INSECURE_REGISTRATION: "1"

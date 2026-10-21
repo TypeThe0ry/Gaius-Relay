@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import { ephemeralCredential } from "./test-support.mjs";
 
 const host = "127.0.0.1";
 const directory = fileURLToPath(new URL(".", import.meta.url));
-const bridgeToken = "relay-abuse-runtime-generated-token";
-const registryToken = "relay-abuse-smoke-registry-token";
+const bridgeToken = ephemeralCredential("bridge");
+const registryToken = ephemeralCredential("registry");
 
 function assert(condition, label) {
     if (!condition) {

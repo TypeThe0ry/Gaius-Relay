@@ -4,8 +4,8 @@ set -euo pipefail
 # Read-only public deployment check.  It deliberately uses the hosted Pages
 # origin and the file:// origin separately so a permissive wildcard cannot hide
 # a missing production allow-list entry.
-base_url=${GAIUS_VERIFY_BASE_URL:-https://example.com}
-pages_origin=${GAIUS_VERIFY_PAGES_ORIGIN:-https://example.com}
+base_url=${GAIUS_VERIFY_BASE_URL:-https://relay-proxy.example.com}
+pages_origin=${GAIUS_VERIFY_PAGES_ORIGIN:-https://play.example.com}
 file_origin=${GAIUS_VERIFY_FILE_ORIGIN:-null}
 target_host=${GAIUS_VERIFY_TARGET_HOST:-}
 target_port=${GAIUS_VERIFY_TARGET_PORT:-}

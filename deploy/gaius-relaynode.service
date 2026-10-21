@@ -7,10 +7,10 @@ After=network-online.target
 Type=simple
 User=gaius
 Group=gaius
-WorkingDirectory=/opt/gaius/apps/bridge
+WorkingDirectory=/opt/gaius/relay
 EnvironmentFile=/etc/gaius/relaynode.env
 Environment=NODE_ENV=production
-ExecStart=/usr/bin/node /opt/gaius/apps/bridge/dist/main.js
+ExecStart=/usr/bin/node /opt/gaius/relay/dist/main.js
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s

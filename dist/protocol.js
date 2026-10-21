@@ -1,14 +1,6 @@
-// The RelayNode only needs a small, versioned view of the Minecraft wire
-// protocol. Keep this module local to the bridge image: the Docker build
-// intentionally copies apps/bridge/dist without the browser/client packages.
-//
-// Packet ids are the ProtocolInfoBuilder registration order in each profile's
-// client archive (GameProtocols/ConfigurationProtocols/LoginProtocols), checked
-// against the vanilla data generator's reports/packets.json for the same archive.
-// Never derive a new profile's table from an older one: 26.3 (777) inserted
-// post_effects into CONFIGURATION and three clientbound PLAY packets, so its
-// ids differ from 26.2 (776) even where the packet names match. LOGIN ids are
-// unchanged across 1.21.11 (774), 26.2 (776) and 26.3 (777).
+// Versioned wire-contract data used by the RelayNode. The Docker image ships
+// this module with the transport runtime and no browser client packages.
+// Keep each profile table explicit: protocol revisions can change packet ids.
 
 const commonLoginIds = Object.freeze({
     clientboundDisconnect: 0,

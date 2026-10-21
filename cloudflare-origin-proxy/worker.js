@@ -1,7 +1,7 @@
-const UPSTREAM_ORIGIN = "https://example.com";
+const UPSTREAM_ORIGIN = "https://relay.example.com";
 const ALLOWED_ORIGINS = new Set([
   "null",
-  "https://example.com",
+  "https://play.example.com",
 ]);
 
 const ALLOWED_PATHS = new Set([
@@ -96,7 +96,7 @@ export default {
       return await proxyRequest(request);
     } catch (error) {
       console.error(JSON.stringify({
-        event: "gaius-pages-relay-proxy-error",
+        event: "gaius-relay-origin-proxy-error",
         path: new URL(request.url).pathname,
         message: String(error?.message || error),
       }));
