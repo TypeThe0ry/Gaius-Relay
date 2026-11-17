@@ -1159,7 +1159,47 @@ httpServer.on("upgrade", (request, socket, head) => {
         webSocketServer.emit("connection", webSocket, request);
     });
 });
-webSocketServer.on("connection", (webSocket) => {
+
+const maximumEmbeddedConnectBytes = 1024;
+// Returns the connect-request JSON carried in `?c=` when the relay can safely
+// honour it, otherwise undefined (the normal control-message path applies).
+function embeddedConnectControl(request) {
+    if (request === undefined || config.accessToken !== undefined) {
+        return undefined;
+    }
+    let encoded;
+    try {
+        encoded = new URL(request.url ?? "/", "http://localhost").searchParams.get("c");
+    }
+    catch {
+        return undefined;
+    }
+    if (encoded === null || encoded.length === 0 ||
+        encoded.length > maximumEmbeddedConnectBytes * 2 ||
+        !/^[A-Za-z0-9_-]+$/.test(encoded)) {
+        return undefined;
+    }
+    const decoded = Buffer.from(encoded, "base64url");
+    if (decoded.byteLength === 0 || decoded.byteLength > maximumEmbeddedConnectBytes) {
+        return undefined;
+    }
+    const text = decoded.toString("utf8");
+    try {
+        const parsed = JSON.parse(text);
+        if (typeof parsed !== "object" || parsed === null || parsed.type !== "connect" ||
+            "token" in parsed || "skinDescriptor" in parsed) {
+            return undefined;
+        }
+        if (parseLocalTunnelHost(String(parsed.host ?? "")) !== undefined) {
+            return undefined;
+        }
+    }
+    catch {
+        return undefined;
+    }
+    return text;
+}
+webSocketServer.on("connection", (webSocket, upgradeRequest) => {
     const relayFrameTimelineState = createRelayFrameTimelineState();
     activeTunnelLeases.add(webSocket);
     let tunnelLeaseReleased = false;
@@ -2154,7 +2194,7 @@ webSocketServer.on("connection", (webSocket) => {
     webSocket.on("message", () => {
         lastActivity = Date.now();
     });
-    webSocket.once("message", (rawData, isBinary) => {
+    const handleConnectControl = (rawData, isBinary) => {
         lastActivity = Date.now();
         if (isBinary) {
             closeBoth(1003, "Expected connect control message");
@@ -2746,7 +2786,19 @@ webSocketServer.on("connection", (webSocket) => {
             console.error("Invalid bridge control message:", error);
             closeBoth(1007, "Invalid connect control message");
         }
-    });
+    };
+    // Optional single-round-trip start: a client may carry the connect request
+    // in the upgrade URL (/tunnel?c=<base64url JSON>) so the TCP dial begins
+    // during the WebSocket upgrade instead of after an extra control message.
+    // Token-protected relays and local tunnels keep the control-message path so
+    // credentials and skin descriptors never appear in URLs or access logs.
+    const embeddedConnect = embeddedConnectControl(upgradeRequest);
+    if (embeddedConnect === undefined) {
+        webSocket.once("message", handleConnectControl);
+    }
+    else {
+        handleConnectControl(Buffer.from(embeddedConnect, "utf8"), false);
+    }
     webSocket.once("error", (error) => {
         console.error("WebSocket tunnel error:", error.message);
         closeBoth(1011, "WebSocket error");
@@ -3813,7 +3865,9 @@ function handleRelayNodeManifest(request, response, requestUrl) {
             lastSuccessAt: relayRegistrationState.lastSuccessAt,
             lastError: relayRegistrationState.lastError,
         },
-        capabilities: relayCapabilities,
+        capabilities: config.accessToken === undefined
+            ? [...relayCapabilities, "url-connect"]
+            : relayCapabilities,
     });
     const headers = {
         "cache-control": "no-store",
