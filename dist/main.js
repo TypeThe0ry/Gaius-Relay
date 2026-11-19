@@ -127,6 +127,7 @@ const localTunnelWaitMs = 10 * 60 * 1000;
 const maximumLocalPrePairFrames = 256;
 const maximumLocalPrePairBytes = 8 * 1024 * 1024;
 const relayCapabilities = [
+    "target-prewarm",
     "tcp-tunnel",
     "ephemeral-tunnel-lease",
     "target-affinity",
@@ -1160,6 +1161,13 @@ httpServer.on("upgrade", (request, socket, head) => {
     });
 });
 
+const prewarmIdleMs = Math.max(1000, Number(process.env.RELAY_PREWARM_IDLE_MS ?? 20_000) || 20_000);
+const prewarmClients = new Set();
+function prewarmClientKey(request) {
+    const forwarded = request?.headers?.["cf-connecting-ip"] ?? request?.headers?.["x-forwarded-for"];
+    const first = typeof forwarded === "string" ? forwarded.split(",")[0].trim() : "";
+    return first.length > 0 ? first : String(request?.socket?.remoteAddress ?? "unknown");
+}
 const maximumEmbeddedConnectBytes = 1024;
 // Returns the connect-request JSON carried in `?c=` when the relay can safely
 // honour it, otherwise undefined (the normal control-message path applies).
@@ -2191,8 +2199,24 @@ webSocketServer.on("connection", (webSocket, upgradeRequest) => {
         });
         return result;
     };
+    let prewarmTimer;
+    let prewarmKey;
+    const endPrewarm = () => {
+        if (prewarmTimer !== undefined) {
+            clearTimeout(prewarmTimer);
+            prewarmTimer = undefined;
+        }
+    };
     webSocket.on("message", () => {
         lastActivity = Date.now();
+        endPrewarm();
+    });
+    webSocket.once("close", () => {
+        endPrewarm();
+        if (prewarmKey !== undefined) {
+            prewarmClients.delete(prewarmKey);
+            prewarmKey = undefined;
+        }
     });
     const handleConnectControl = (rawData, isBinary) => {
         lastActivity = Date.now();
@@ -2218,6 +2242,17 @@ webSocketServer.on("connection", (webSocket, upgradeRequest) => {
                 closeBoth(1008, "Destination is not allowed");
                 return;
             }
+            if (request.prewarm === true) {
+                // Target prewarm: dial now, then wait idle for the first client
+                // bytes.  One prewarm per client address, closed if unused.
+                const key = prewarmClientKey(upgradeRequest);
+                if (prewarmClients.has(key)) {
+                    closeBoth(1013, "Prewarm limit");
+                    return;
+                }
+                prewarmClients.add(key);
+                prewarmKey = key;
+            }
             webSocket.send(JSON.stringify({
                 type: "connecting",
                 targetConnectTimeoutMs: config.connectTimeoutMs,
@@ -2236,6 +2271,12 @@ webSocketServer.on("connection", (webSocket, upgradeRequest) => {
                 tcpSocket.setTimeout(0);
                 releaseTargetRoute = acquireTargetRoute(request);
                 connected = true;
+                if (request.prewarm === true) {
+                    prewarmTimer = setTimeout(() => {
+                        closeBoth(1001, "Prewarm idle");
+                    }, prewarmIdleMs);
+                    prewarmTimer.unref();
+                }
                 const candidate = tcpSocket.gaiusTarget ?? request;
                 webSocket.send(JSON.stringify({
                     type: "connected",

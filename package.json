@@ -10,11 +10,12 @@
     "start": "node dist/main.js",
     "start:registry": "node dist/registry.js",
     "test": "npm run smoke",
-    "smoke": "node framed-stream-smoke.mjs && node relay-frame-batching-smoke.mjs && node client-tcp-bounded-drain-smoke.mjs && node resource-pack-timeout-smoke.mjs && node resource-pack-stream-smoke.mjs && node registry-smoke.mjs && node bandwidth-smoke.mjs && node telemetry-smoke.mjs && node abuse-contact-smoke.mjs && node relay-frame-timeline-smoke.mjs && node url-connect-smoke.mjs . 8793 40",
+    "smoke": "node framed-stream-smoke.mjs && node relay-frame-batching-smoke.mjs && node client-tcp-bounded-drain-smoke.mjs && node resource-pack-timeout-smoke.mjs && node resource-pack-stream-smoke.mjs && node registry-smoke.mjs && node bandwidth-smoke.mjs && node telemetry-smoke.mjs && node abuse-contact-smoke.mjs && node relay-frame-timeline-smoke.mjs && node url-connect-smoke.mjs . 8793 40 && node target-prewarm-smoke.mjs . 8794",
     "smoke:bandwidth": "node bandwidth-smoke.mjs",
     "smoke:telemetry": "node telemetry-smoke.mjs",
     "smoke:abuse-contact": "node abuse-contact-smoke.mjs",
-    "smoke:url-connect": "node url-connect-smoke.mjs . 8793 40"
+    "smoke:url-connect": "node url-connect-smoke.mjs . 8793 40",
+    "smoke:target-prewarm": "node target-prewarm-smoke.mjs . 8794"
   },
   "dependencies": {
     "ws": "8.21.0"
