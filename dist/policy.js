@@ -56,6 +56,9 @@ export function parseConnectRequest(text) {
         typeof candidate.token !== "string") {
         throw new TypeError("Connect token must be a string");
     }
+    if (candidate.prewarm !== undefined && typeof candidate.prewarm !== "boolean") {
+        throw new TypeError("Connect prewarm must be a boolean");
+    }
     const skinDescriptor = parseSkinDescriptor(candidate.skinDescriptor);
     const host = normalizeConnectHost(candidate.host, candidate.port);
     if (host.length === 0 || (isIP(host) === 0 && !isValidDnsName(host))) {
@@ -70,6 +73,7 @@ export function parseConnectRequest(text) {
         host,
         port: candidate.port,
         ...(candidate.token === undefined ? {} : { token: candidate.token }),
+        ...(candidate.prewarm === true ? { prewarm: true } : {}),
         ...(skinDescriptor === undefined ? {} : { skinDescriptor }),
     };
 }
