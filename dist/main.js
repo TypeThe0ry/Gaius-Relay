@@ -13,6 +13,7 @@ import { isHostAllowed, isOriginAllowed, isPrivateNetworkAddress, normalizeHost,
 import { MINECRAFT_PROFILES, resolveMinecraftProfile } from "./protocol.js";
 import { MinecraftFrameAccumulator } from "./framed-stream.js";
 import { createBandwidthScheduler, createTokenBucket, createTrafficMeter, createTunnelLimiter, } from "./bandwidth.js";
+import { createStatsReporter } from "./stats-report.js";
 import { createTelemetryCollector, createTelemetryExporter, createTelemetryListener, relayMetricProviders, } from "./telemetry.js";
 const config = loadConfig();
 const serviceVersion = readServiceVersion();
@@ -1159,7 +1160,13 @@ httpServer.on("upgrade", (request, socket, head) => {
         webSocketServer.emit("connection", webSocket, request);
     });
 });
-webSocketServer.on("connection", (webSocket) => {
+const statsReporter = createStatsReporter({
+    url: process.env.GAIUS_STATS_URL,
+    key: process.env.GAIUS_STATS_KEY,
+    node: process.env.GAIUS_RELAY_NODE_ID || process.env.GAIUS_RELAY_NODE_NAME,
+});
+webSocketServer.on("connection", (webSocket, request) => {
+    statsReporter.recordConnection(request?.headers?.["x-forwarded-for"]?.split(",")[0]?.trim() || request?.socket?.remoteAddress);
     const relayFrameTimelineState = createRelayFrameTimelineState();
     activeTunnelLeases.add(webSocket);
     let tunnelLeaseReleased = false;
